@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Qualoo Real-time Nexus: Interactive 3D visualization of global latency data using Three.js." />
+  <meta name="theme-color" content="#000000" />
+  <title>Qualoo Real-time Nexus</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@300;400&display=swap" rel="stylesheet" />
+
+  <!-- Core Styles -->
+  <link rel="stylesheet" href="./styles.css">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: 'Roboto', sans-serif;
+      background-color: #000;
+      color: #fff;
+    }
+
+    #canvas-container {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+    }
+
+    #loading-indicator, #error-container {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      padding: 10px;
+      background: rgba(0,0,0,0.7);
+      z-index: 100;
+    }
+
+    #error-container {
+      color: red;
+      display: none;
+    }
+
+    #hud-stats {
+      position: fixed;
+      bottom: 180px; /* Moved down more to avoid logo overlap */
+      right: 20px; /* Position on the right side */
+      z-index: 5000;
+      background: rgba(0,0,0,0.8);
+      padding: 15px;
+      border-radius: 10px;
+      font-family: 'Orbitron', sans-serif;
+      font-size: 14px;
+      box-shadow: 0 0 20px rgba(0,229,255,0.3);
+      border: 2px solid rgba(0,229,255,0.2);
+      width: 320px; /* Fixed width for side positioning */
+      text-align: left;
+    }
+
+    #hud-stats h3 {
+      margin: 5px 0 10px;
+      color: #00e5ff;
+      font-size: 18px;
+      text-shadow: 0 0 10px rgba(0,229,255,0.5);
+    }
+
+    #hud-stats .title {
+      font-size: 20px;
+      font-weight: bold;
+      color: #00e5ff;
+      margin-bottom: 15px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    #hud-stats .title img {
+      max-height: 50px;
+      width: auto;
+    }
+
+    /* Left side HUD panel for symmetry */
+    #hud-left-panel {
+      position: fixed;
+      bottom: 180px; /* Match the right panel position */
+      left: 20px;
+      z-index: 5000;
+      background: rgba(0,0,0,0.8);
+      padding: 15px;
+      border-radius: 10px;
+      font-family: 'Orbitron', sans-serif;
+      font-size: 12px;
+      box-shadow: 0 0 20px rgba(0,229,255,0.3);
+      border: 2px solid rgba(0,229,255,0.2);
+      width: 200px;
+      text-align: left;
+    }
+
+    #hud-left-panel h4 {
+      margin: 0 0 10px 0;
+      color: #00e5ff;
+      font-size: 14px;
+      text-shadow: 0 0 10px rgba(0,229,255,0.5);
+    }
+
+    #hud-left-panel .stat-item {
+      display: flex;
+      justify-content: space-between;
+      margin: 5px 0;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+
+    #hud-left-panel .stat-label {
+      color: #add8e6;
+    }
+
+    #hud-left-panel .stat-value {
+      color: #00e5ff;
+      font-weight: bold;
+    }
+
+    .alert {
+      color: red;
+      background: rgba(255,0,0,0.2);
+      padding: 5px;
+      margin: 5px 0;
+      border-radius: 3px;
+      animation: fadeIn 2s;
+      box-shadow: 0 0 5px red;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    #menu {
+      position: fixed;
+      bottom: 160px; /* Above news ticker (120px) + margin */
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      background: rgba(0,0,0,0.8);
+      padding: 12px;
+      border-radius: 8px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+      border: 1px solid rgba(0,229,255,0.3);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    }
+
+    #toggle-day-night, #toggle-filters {
+      background: rgba(255,255,255,0.2);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.5);
+      padding: 5px 10px;
+      cursor: pointer;
+      font-family: 'Orbitron', sans-serif;
+      border-radius: 3px;
+    }
+
+    #toggle-day-night:hover, #toggle-filters:hover {
+      background: rgba(255,255,255,0.3);
+    }
+
+    /* Floating matrix box */
+    #region-matrix {
+      position: absolute;
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.85);
+      border-radius: 8px;
+      padding: 10px 15px;
+      max-height: 180px;
+      max-width: 95vw;
+      overflow: auto;
+      z-index: 10;
+      font-family: 'Roboto', sans-serif;
+      font-size: 11px;
+      backdrop-filter: blur(4px);
+      box-shadow: 0 0 8px rgba(0, 255, 0, 0.3);
+      color: white;
+    }
+
+    #region-matrix h4 {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      text-align: center;
+      color: #00ffcc;
+    }
+
+    #matrix-content table {
+      border-collapse: collapse;
+      font-size: 11px;
+      white-space: nowrap;
+      text-align: center;
+      table-layout: fixed;
+      min-width: max-content;
+    }
+
+    #matrix-content th, #matrix-content td {
+      padding: 4px 6px;
+      color: white;
+    }
+
+    #matrix-content th {
+      background-color: #333;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    #matrix-content td {
+      min-width: 45px;
+    }
+
+    #matrix-content td:first-child,
+    #matrix-content th:first-child {
+      background-color: #222;
+      position: sticky;
+      left: 0;
+      z-index: 3;
+      text-align: left;
+    }
+
+    /* Filters Styles */
+    #filters {
+      position: absolute;
+      top: 60px;
+      right: 10px;
+      z-index: 10000;
+      background: rgba(0,0,0,0.9);
+      padding: 15px;
+      border-radius: 5px;
+      width: 250px;
+      display: none; /* Hidden by default */
+      border: 1px solid rgba(255,255,255,0.3);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+
+    #filters.show {
+      display: block;
+    }
+
+    /* Analysis Dashboard Modals */
+    .dashboard-modal {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.95);
+      border: 2px solid #00e5ff;
+      border-radius: 10px;
+      padding: 20px;
+      z-index: 20000;
+      max-width: 90vw;
+      max-height: 90vh;
+      overflow-y: auto;
+      display: none;
+      font-family: 'Orbitron', sans-serif;
+      color: white;
+    }
+
+    .dashboard-modal.show {
+      display: block;
+    }
+
+    .dashboard-modal h2 {
+      color: #00e5ff;
+      margin-top: 0;
+      text-align: center;
+    }
+
+    .dashboard-modal .close-btn {
+      position: absolute;
+      top: 10px;
+      right: 15px;
+      background: none;
+      border: none;
+      color: #ff4444;
+      font-size: 24px;
+      cursor: pointer;
+      padding: 0;
+      width: 30px;
+      height: 30px;
+    }
+
+    .dashboard-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.7);
+      z-index: 19999;
+      display: none;
+    }
+
+    .dashboard-overlay.show {
+      display: block;
+    }
+
+    .dashboard-content {
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+
+    .alert-item, .operator-item {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 5px;
+      padding: 10px;
+      margin: 5px 0;
+    }
+
+    .alert-critical { border-left: 4px solid #ff4444; }
+    .alert-major { border-left: 4px solid #ff8800; }
+    .alert-warning { border-left: 4px solid #ffdd44; }
+
+    .operator-critical { border-left: 4px solid #ff4444; }
+    .operator-major { border-left: 4px solid #ff8800; }
+
+    #filters label {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 12px;
+      color: #add8e6;
+    }
+
+    #filters select {
+      width: 100%;
+      padding: 5px;
+      margin-bottom: 10px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.3);
+      color: white;
+      border-radius: 3px;
+    }
+    #chartjs-bar-region, #chartjs-donut-network {
+  width: 95%;
+  height: 180px;
+  background: rgba(0,0,0,0.05);
+  border-radius: 8px;
+  z-index: 1000;
+  position: relative;
+  display: block;
+  margin: 10px auto;
+}
+    #apply-filters {
+      width: 100%;
+      background: #0bbbda;
+      color: white;
+      border: none;
+      padding: 8px;
+      cursor: pointer;
+      border-radius: 3px;
+      font-family: 'Orbitron', sans-serif;
+    }
+
+    #apply-filters:hover {
+      background: #09a0b8;
+    }
+
+    #clear-filters {
+      width: 100%;
+      background: #ff6b6b;
+      color: white;
+      border: none;
+      padding: 8px;
+      cursor: pointer;
+      border-radius: 3px;
+      font-family: 'Orbitron', sans-serif;
+      margin-top: 5px;
+    }
+
+    #clear-filters:hover {
+      background: #ff5252;
+    }
+
+    /* Remove the bottom charts bar styles */
+    #echarts-charts-bar { display: none !important; }
+    .left-column {
+      position: relative;
+      left: 20px;
+      top: 120px;
+      width: 400px;
+      padding: 15px;
+      background: rgba(0,0,0,0.1); /* Make transparent for debugging */
+      border-radius: 8px;
+      overflow-y: auto;
+      max-height: calc(100% - 150px);
+      box-shadow: 0 0 10px rgba(173,216,230,0.2);
+    }
+  </style>
+</head>
+<body>
+  <!-- Canvas -->
+  <div id="canvas-container"></div>
+  <canvas id="flat-canvas" style="display:none; position:absolute; inset:0; z-index:2; pointer-events:auto;"></canvas>
+  
+  <!-- Main Title removed per user request -->
+  
+  <!-- Camera Controls Help -->
+  <div id="camera-help" style="display: none; position: fixed; top: 120px; right: 20px; z-index: 1000; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; border: 1px solid #00e5ff; color: #00e5ff; font-family: 'Orbitron', sans-serif; font-size: 12px; max-width: 200px;">
+    <h4 style="margin: 0 0 10px 0; color: #00e5ff;">🎮 Camera Controls</h4>
+    <div>🖱️ Drag: Rotate Earth</div>
+    <div>🔍 Scroll: Zoom in/out</div>
+    <div>␣ Space: Pause rotation</div>
+    <div>R: Reset camera</div>
+    <div>N: Day/Night toggle</div>
+  </div>
+  
+  <div id="loading-indicator">Loading application...</div>
+  <div id="error-container"></div>
+  <!-- Left HUD Panel -->
+  <div id="hud-left-panel">
+    <h4>🌐 Live Stats</h4>
+    <div class="stat-item">
+      <span class="stat-label">Active Arcs</span>
+      <span class="stat-value" id="active-arcs">0</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">FPS</span>
+      <span class="stat-value" id="fps-display">60</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Data Points</span>
+      <span class="stat-value" id="data-points">0</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Atmosphere</span>
+      <span class="stat-value" id="atmosphere-status">Active</span>
+    </div>
+  </div>
+
+  <!-- Main HUD Stats (right side) -->
+  <div id="hud-stats"></div>
+  <ul id="insights-list"></ul>
+
+  <!-- Menu -->
+  <div id="menu">
+    <button id="toggle-day-night">Toggle Texture (Day/Night)</button>
+    <button id="toggle-filters">Toggle Filters</button>
+    <button id="toggle-compliance-view">Toggle Compliance View</button>
+    <button id="toggle-latency-view">Toggle Latency View</button>
+    <button id="toggle-countries">Toggle Country Outlines</button>
+    <button id="toggle-exploded-countries">🌌 Explode Countries</button>
+    <button id="toggle-lines">Toggle Lines</button>
+    <button id="toggle-projection">Toggle Flat View</button>
+    <button id="toggle-rotation">Toggle Rotation</button>
+    <button id="toggle-globe-mesh">Toggle Globe</button>
+    <button id="toggle-country-labels">Country Names</button>
+    <button id="show-24h-alerts">📊 24h Alerts Dashboard</button>
+    <button id="show-hourly-worst">⚠️ 3H Worst Operators</button>
+    <button id="show-high-latency-24h">🔴 24h High Latency Analysis</button>
+  </div>
+
+  <!-- Alerts container absolutely positioned top left, always above HUD -->
+  <div class="alerts-container" style="position:fixed; top:10px; left:10px; width:340px; z-index:9999; background:none; box-shadow:none; pointer-events:none;"></div>
+
+  <!-- Regional Performance Drill Down -->
+  <div id="regional-drill-down" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.95); border-radius: 12px; padding: 20px; z-index: 1000; display: none; min-width: 800px; min-height: 600px; box-shadow: 0 0 30px rgba(0,255,255,0.3); border: 2px solid #00e5ff;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+      <h2 style="margin: 0; color: #00e5ff; font-family: 'Orbitron', sans-serif;">Regional Performance Analysis</h2>
+      <button id="close-drill-down" style="background: #ff4444; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: 'Orbitron', sans-serif;">Close</button>
+    </div>
+    
+    <div style="display: flex; gap: 20px;">
+      <!-- Chord Chart Container -->
+      <div id="chord-chart-container" style="flex: 1; min-height: 500px; background: rgba(0,0,0,0.3); border-radius: 8px; padding: 10px;">
+        <h3 style="margin: 0 0 10px 0; color: #00e5ff; text-align: center;">Connection Matrix</h3>
+        <div id="chord-chart" style="width: 100%; height: 450px;"></div>
+      </div>
+      
+      <!-- Details Panel -->
+      <div id="drill-down-details" style="width: 300px; background: rgba(0,0,0,0.3); border-radius: 8px; padding: 15px;">
+        <h3 style="margin: 0 0 15px 0; color: #00e5ff;">Details</h3>
+        <div id="selected-entity-info">
+          <p style="color: #ccc; font-style: italic;">Select a region or connection to view details</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Region Matrix (existing) -->
+  <div id="region-matrix" hidden>
+    <h4>Regional Latency Matrix</h4>
+    <div id="matrix-content"></div>
+  </div>
+
+  <!-- Filters Panel -->
+  <div id="filters">
+    <label for="source-country">Source Country</label>
+    <select id="source-country">
+      <option value="">All</option>
+    </select>
+
+    <label for="source-region">Source Region</label>
+    <select id="source-region">
+      <option value="">All</option>
+    </select>
+
+    <label for="source-operator">Source Operator</label>
+    <select id="source-operator">
+      <option value="">All</option>
+    </select>
+
+    <label for="network-type">Network Type</label>
+    <select id="network-type">
+      <option value="">All</option>
+      <option value="mobile">Mobile</option>
+      <option value="wifi">WiFi</option>
+      <option value="wired">Wired</option>
+      <option value="unknown">Unknown</option>
+    </select>
+
+    <label for="dest-country">Destination Country</label>
+    <select id="dest-country">
+      <option value="">All</option>
+    </select>
+
+    <label for="dest-region">Destination Region</label>
+    <select id="dest-region">
+      <option value="">All</option>
+    </select>
+
+    <button id="apply-filters">Apply Filters</button>
+    <button id="clear-filters">Clear Filters</button>
+  </div>
+
+  <!-- Analysis Dashboard Modals -->
+  <div id="dashboard-overlay" class="dashboard-overlay"></div>
+
+  <div id="alerts-dashboard" class="dashboard-modal">
+    <button class="close-btn" onclick="closeDashboard('alerts-dashboard')">&times;</button>
+    <h2>🚨 24-Hour Alerts Dashboard</h2>
+    <div class="dashboard-content">
+      <p>Loading 24-hour alerts data...</p>
+      <div id="alerts-content"></div>
+    </div>
+  </div>
+
+  <div id="operators-dashboard" class="dashboard-modal">
+    <button class="close-btn" onclick="closeDashboard('operators-dashboard')">&times;</button>
+    <h2>⚠️ 3-Hour Worst Operators</h2>
+    <div class="dashboard-content">
+      <p>Loading 3-hour worst operators data...</p>
+      <div id="operators-content"></div>
+    </div>
+  </div>
+
+  <div id="high-latency-dashboard" class="dashboard-modal">
+    <button class="close-btn" onclick="closeDashboard('high-latency-dashboard')">&times;</button>
+    <h2>🔴 24-Hour High Latency Analysis</h2>
+    <div class="dashboard-content">
+      <p>Loading high-latency analysis data...</p>
+      <div id="high-latency-content"></div>
+    </div>
+  </div>
+
+  <!-- Configuration -->
+  <script src="./config.js"></script>
+  <!-- Tween.js for animations -->
+  <script src="https://cdn.jsdelivr.net/npm/@tweenjs/tween.js@18.6.4/dist/tween.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Three.js ES Modules approach -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.152.2/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.152.2/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // Make THREE and OrbitControls globally available
+    window.THREE = THREE;
+    window.OrbitControls = OrbitControls;
+
+    console.log('✅ Three.js loaded via ES modules, version:', THREE.REVISION);
+    console.log('✅ OrbitControls loaded via ES modules');
+  </script>
+  <!-- D3.js for bubble chart -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <!-- D3 Chord for chord diagrams -->
+  <script src="https://d3js.org/d3-chord.v3.min.js"></script>
+  <!-- App Logic -->
+  <script src="./app.js"></script>
+
+  <!-- App Bootstrapping -->
+  <script type="module">
+    (async function () {
+      const loadingIndicator = document.getElementById('loading-indicator');
+      const errorDiv = document.getElementById('error-container');
+
+      const showError = (message) => {
+        console.error(message);
+        if (errorDiv) {
+          errorDiv.textContent = message;
+          errorDiv.style.display = 'block';
+        }
+        if (loadingIndicator) {
+          loadingIndicator.textContent = 'Error: ' + message;
+        }
+      };
+
+      try {
+        await new Promise(resolve => {
+          const wait = () => {
+            if (typeof window.initGlobalLatencyView === 'function') resolve();
+            else setTimeout(wait, 100);
+          };
+          wait();
+        });
+        await window.initGlobalLatencyView();
+        if (loadingIndicator) loadingIndicator.style.display = 'none';
+        document.getElementById('region-matrix')?.removeAttribute('hidden');
+      } catch (err) {
+        showError(err.message || 'Initialization failed');
+      }
+    })();
+  </script>
+  <div id="chord-tooltip" style="position: fixed; pointer-events: none; opacity: 0; background: rgba(0,0,0,0.95); color: white; padding: 12px 18px; border-radius: 8px; border: 2px solid #00e5ff; font-size: 14px; z-index: 99999; box-shadow: 0 4px 16px rgba(0,0,0,0.4); transition: opacity 0.2s; min-width: 180px; max-width: 320px;"></div>
+</body>
+</html>
