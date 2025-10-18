@@ -1,39 +1,41 @@
 // Global Configuration
 const CONFIG = {
-  radius: 5,
-  batchSize: 300,
-  batchInterval: 500,
-  fetchBatchSize: 1250,
-  maxActiveArcs: 850,
-  arcDuration: 6000,
+  radius: 4,
+  batchSize: 200,
+  batchInterval: 1000,
+  fetchBatchSize: 800,  // Increased from 400 for faster data loading
+  maxActiveArcs: 300,
+  arcDuration: 3800,
   arcFadeTime: 1000,
-  traceTime: 6000,
+  traceTime: 2000,
   debug: true,
   statsDataLimit: 50000,
   animationBatchSize: 300,
   animationBatchInterval: 500,
   latencyThresholds: {
-    excellent: 100,
-    good: 100,
-    average: 200,
-    poor: 300,
-    bad: 400,
+    excellent: 150,
+    good: 250,
+    average: 300,
+    poor: 400,
+    bad: Infinity,
     terrible: Infinity
   },
+  // Bright, high-contrast RAG palette (as requested)
   colors: {
-    excellent: 0x005a00,
-    good: 0x038103,
-    average: 0xbe8c00,
-    poor: 0xec6f09,
-    bad: 0xa51f1f,
-    terrible: 0xc04545
+    // Green, Yellow, Amber, Red
+    excellent: '#348939', // bright green
+    good: '#FDBF02',      // bright yellow
+    average: '#FE7E03',   // bright amber
+    poor: '#9B1D1E',      // deep red
+    bad: '#9B1D1E',       // same deep red for bad
+    terrible: '#D7263D'   // vivid crimson for extreme
   },
   highlightThreshold: 400,
   arcHeightFactor: 0.08,
-  particleSpeed: 0.9,
-  glowIntensity: 2.5,
-  pointSize: 3.0,
-  dotSize: 8.0,
+  particleSpeed: 0.05,
+  glowIntensity: 3,
+  pointSize: 0.1,
+  dotSize: 5.0,
   starfieldRadius: 1000,
   arcSegments: 100
 };
@@ -127,8 +129,8 @@ const TTS_PRIORITY = {
   INFO: 4
 };
 
-const MIN_TTS_INTERVAL = 3000;
-const POST_TTS_COOLDOWN = 15000;
+const MIN_TTS_INTERVAL = 2400;  // Doubled from 1200
+const POST_TTS_COOLDOWN = 10000;  // Doubled from 5000 (10 seconds between TTS)
 const AUDIO_DETECTION_THRESHOLD = 0.1;
 
 // Make all constants globally available

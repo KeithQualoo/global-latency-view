@@ -30,6 +30,15 @@
       position: relative;
     }
 
+    /* Ensure WebGL canvas is bottom-most within container */
+    #canvas-container > canvas {
+      position: absolute;
+      inset: 0;
+      z-index: 10;
+    }
+
+    /* Legacy Three.js canvas visible */
+
     #loading-indicator, #error-container {
       position: absolute;
       top: 10px;
@@ -46,17 +55,17 @@
 
     #hud-stats {
       position: fixed;
-      bottom: 180px; /* Moved down more to avoid logo overlap */
+      bottom: 220px; /* More clearance over bottom tables */
       right: 20px; /* Position on the right side */
       z-index: 5000;
-      background: rgba(0,0,0,0.8);
+      background: transparent; /* Prevent dimming the globe behind */
       padding: 15px;
       border-radius: 10px;
       font-family: 'Orbitron', sans-serif;
-      font-size: 14px;
+      font-size: 16px;
       box-shadow: 0 0 20px rgba(0,229,255,0.3);
       border: 2px solid rgba(0,229,255,0.2);
-      width: 320px; /* Fixed width for side positioning */
+      width: 436px; /* +10% again */
       text-align: left;
     }
 
@@ -86,17 +95,17 @@
     /* Left side HUD panel for symmetry */
     #hud-left-panel {
       position: fixed;
-      bottom: 180px; /* Match the right panel position */
+      bottom: 220px; /* Align with right panel and clear bottom elements */
       left: 20px;
       z-index: 5000;
       background: rgba(0,0,0,0.8);
       padding: 15px;
       border-radius: 10px;
       font-family: 'Orbitron', sans-serif;
-      font-size: 12px;
+      font-size: 16px;
       box-shadow: 0 0 20px rgba(0,229,255,0.3);
       border: 2px solid rgba(0,229,255,0.2);
-      width: 200px;
+      width: 290px; /* +10% again */
       text-align: left;
     }
 
@@ -144,16 +153,36 @@
       bottom: 160px; /* Above news ticker (120px) + margin */
       left: 50%;
       transform: translateX(-50%);
-      z-index: 1000;
+      z-index: 20060; /* Above HUD, filters, and ticker */
       background: rgba(0,0,0,0.8);
       padding: 12px;
       border-radius: 8px;
-      display: flex;
+      display: none; /* Hidden by default */
       gap: 8px;
       flex-wrap: wrap;
       justify-content: center;
       border: 1px solid rgba(0,229,255,0.3);
       box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+      pointer-events: auto;
+    }
+
+    #settings-toggle {
+      position: fixed;
+      bottom: 120px;
+      right: 20px;
+      z-index: 20060; /* Keep above most UI */
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: 1px solid rgba(0,229,255,0.6);
+      background: rgba(0,0,0,0.8);
+      color: #00e5ff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 16px rgba(0,229,255,0.3);
+      font-family: 'Orbitron', sans-serif;
     }
 
     #toggle-day-night, #toggle-filters {
@@ -233,10 +262,10 @@
 
     /* Filters Styles */
     #filters {
-      position: absolute;
+      position: fixed;
       top: 60px;
       right: 10px;
-      z-index: 10000;
+      z-index: 20050; /* Above HUD and ticker */
       background: rgba(0,0,0,0.9);
       padding: 15px;
       border-radius: 5px;
@@ -244,6 +273,7 @@
       display: none; /* Hidden by default */
       border: 1px solid rgba(255,255,255,0.3);
       box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      pointer-events: auto;
     }
 
     #filters.show {
@@ -399,6 +429,31 @@
       max-height: calc(100% - 150px);
       box-shadow: 0 0 10px rgba(173,216,230,0.2);
     }
+
+    /* Hide overlays by default to avoid global dimming */
+    .dashboard-overlay,
+    .dashboard-modal,
+    #filters,
+    #menu,
+    #hud-left-panel,
+    #loading-indicator { display: none; }
+
+    /* Show only when explicitly toggled */
+    .dashboard-overlay.show,
+    .dashboard-modal.show,
+    #filters.show,
+    #menu.show,
+    #hud-left-panel.show,
+    #loading-indicator.show { display: block; }
+
+    /* No-veil mode during globe view */
+    body.globe-mode #loading-indicator,
+    body.globe-mode .dashboard-overlay,
+    body.globe-mode .dashboard-modal {
+      display: none !important;
+      opacity: 0 !important;
+      background: transparent !important;
+    }
   </style>
 </head>
 <body>
@@ -421,7 +476,7 @@
   <div id="loading-indicator">Loading application...</div>
   <div id="error-container"></div>
   <!-- Left HUD Panel -->
-  <div id="hud-left-panel">
+  <div id="hud-left-panel" style="display:none;">
     <h4>🌐 Live Stats</h4>
     <div class="stat-item">
       <span class="stat-label">Active Arcs</span>
@@ -446,11 +501,14 @@
   <ul id="insights-list"></ul>
 
   <!-- Menu -->
+  <button id="settings-toggle" title="Settings">⚙️</button>
   <div id="menu">
     <button id="toggle-day-night">Toggle Texture (Day/Night)</button>
     <button id="toggle-filters">Toggle Filters</button>
     <button id="toggle-compliance-view">Toggle Compliance View</button>
     <button id="toggle-latency-view">Toggle Latency View</button>
+      <button id="toggle-qualoo-colors">Qualoo Colors</button>
+      <button id="toggle-music-sync">Music Sync</button>
     <button id="toggle-countries">Toggle Country Outlines</button>
     <button id="toggle-exploded-countries">🌌 Explode Countries</button>
     <button id="toggle-lines">Toggle Lines</button>
@@ -498,10 +556,28 @@
 
   <!-- Filters Panel -->
   <div id="filters">
+    <h3 style="color: #00e5ff; margin-bottom: 10px;">🔍 DATA FILTERS</h3>
+    
+    <label for="filter-start-date">Start Date/Time</label>
+    <input type="datetime-local" id="filter-start-date" />
+    
+    <label for="filter-end-date">End Date/Time</label>
+    <input type="datetime-local" id="filter-end-date" />
+    
+    <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+      <button id="filter-last-hour" style="flex: 1; padding: 5px; font-size: 11px;">Last Hour</button>
+      <button id="filter-last-24h" style="flex: 1; padding: 5px; font-size: 11px;">Last 24h</button>
+      <button id="filter-last-week" style="flex: 1; padding: 5px; font-size: 11px;">Last Week</button>
+    </div>
+
     <label for="source-country">Source Country</label>
     <select id="source-country">
       <option value="">All</option>
     </select>
+    
+    <button id="quick-both-directions" style="width: 100%; padding: 6px; margin: 5px 0; font-size: 11px; background: rgba(255,200,0,0.2); border: 1px solid rgba(255,200,0,0.4); border-radius: 4px; cursor: pointer; color: #ffd700;">
+      ↕️ Show Traffic FROM & TO selected source country
+    </button>
 
     <label for="source-region">Source Region</label>
     <select id="source-region">
@@ -575,8 +651,10 @@
   <script type="importmap">
     {
       "imports": {
-        "three": "https://unpkg.com/three@0.152.2/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.152.2/examples/jsm/"
+        "three": "https://esm.sh/three@0.160.0",
+        "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/",
+        "three/examples/jsm/": "https://esm.sh/three@0.160.0/examples/jsm/",
+        "three/webgpu": "data:application/javascript,export default {}"
       }
     }
   </script>
@@ -597,6 +675,7 @@
   <script src="https://d3js.org/d3-chord.v3.min.js"></script>
   <!-- App Logic -->
   <script src="./app.js"></script>
+
 
   <!-- App Bootstrapping -->
   <script type="module">
@@ -631,6 +710,7 @@
       }
     })();
   </script>
+
   <div id="chord-tooltip" style="position: fixed; pointer-events: none; opacity: 0; background: rgba(0,0,0,0.95); color: white; padding: 12px 18px; border-radius: 8px; border: 2px solid #00e5ff; font-size: 14px; z-index: 99999; box-shadow: 0 4px 16px rgba(0,0,0,0.4); transition: opacity 0.2s; min-width: 180px; max-width: 320px;"></div>
 </body>
 </html>

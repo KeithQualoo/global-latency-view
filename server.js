@@ -21,6 +21,8 @@ const env = cleanEnv(process.env, {
   DB_NAME: str({ default: 'postgres' }),
   DB_PASSWORD: str({ default: 'eUgZp5iJ3OieR9' }),
   DB_PORT: envPort({ default: 5501 }),
+  OPENAI_API_KEY: str({ default: '' }),
+  ELEVENLABS_API_KEY: str({ default: '' })
 });
 
 const port = env.PORT;
@@ -78,7 +80,9 @@ app.use(
         ...helmet.contentSecurityPolicy.getDefaultDirectives(),
         'img-src': ["'self'", 'data:', 'https://cdn.jsdelivr.net'],
         'script-src': ["'self'", 'https://cdn.jsdelivr.net', 'https://unpkg.com'],
-        'connect-src': ["'self'", 'http://localhost:8000'], // Updated for local development
+        'connect-src': ["'self'", 'http://localhost:8000', 'https://api.openai.com', 'https://api.elevenlabs.io'],
+        'media-src': ["'self'", 'blob:'],
+        'worker-src': ["'self'", 'blob:'],
       },
     } : false,
   })
@@ -88,7 +92,7 @@ app.use(cors({
   origin: 'http://localhost:8000', // Specific origin for development
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-ElevenLabs-Key', 'xi-api-key', 'X-OpenAI-Key']
 }));
 
 app.options('*', cors());
@@ -136,6 +140,144 @@ app.get('/app.js', (req, res) => {
       'Cache-Control': 'no-cache, no-store, must-revalidate'
     }
   });
+});
+
+// Secure TTS proxy using server-side OpenAI key (no key leaks to client)
+app.post('/api/tts', async (req, res) => {
+  try {
+    const apiKey = env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(400).json({ error: 'OPENAI_API_KEY is not configured on the server' });
+    }
+    const { text, voice = 'nova', model = 'gpt-4o-mini-tts' } = req.body || {};
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Missing text for TTS' });
+    }
+
+    const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ model, input: text, voice })
+    });
+
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      logger.error('OpenAI TTS error: %s', msg);
+      return res.status(resp.status).json({ error: 'OpenAI TTS request failed' });
+    }
+
+    const arrayBuf = await resp.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(Buffer.from(arrayBuf));
+  } catch (err) {
+    logger.error('TTS proxy error: %o', err);
+    return res.status(500).json({ error: 'TTS proxy failed' });
+  }
+});
+
+// ElevenLabs TTS proxy (server-side key usage)
+app.post('/api/tts/eleven', async (req, res) => {
+  try {
+    const headerKey = req.get('X-ElevenLabs-Key') || req.get('xi-api-key');
+    const elevenKey = env.ELEVENLABS_API_KEY || (process.env.NODE_ENV !== 'production' ? headerKey : '');
+    if (!elevenKey) {
+      return res.status(400).json({ error: 'ELEVENLABS_API_KEY missing. Set server env or send X-ElevenLabs-Key header in development.' });
+    }
+    const {
+      text,
+      voiceId = 'yf18OYKcMjTlVAGNuq5t',
+      model = 'eleven_multilingual_v2',
+      output_format = 'mp3_44100_128',
+      language_code = null
+    } = req.body || {};
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Missing text for TTS' });
+    }
+
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
+    const resp = await fetch(url + `?output_format=${encodeURIComponent(output_format)}` , {
+      method: 'POST',
+      headers: {
+        'xi-api-key': elevenKey,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg'
+      },
+      body: JSON.stringify({
+        model_id: model,
+        text,
+        ...(language_code ? { language_code } : {}),
+        // Voice settings optional; defaults are fine
+      })
+    });
+
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      logger.error('ElevenLabs TTS error: %s', msg);
+      return res.status(resp.status).json({ error: 'ElevenLabs TTS request failed' });
+    }
+
+    const arrayBuf = await resp.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(Buffer.from(arrayBuf));
+  } catch (err) {
+    logger.error('ElevenLabs TTS proxy error: %o', err);
+    return res.status(500).json({ error: 'ElevenLabs TTS proxy failed' });
+  }
+});
+
+// Simple translation endpoint using OpenAI
+app.post('/api/translate', async (req, res) => {
+  try {
+    const headerKey = req.get('X-OpenAI-Key');
+    const apiKey = env.OPENAI_API_KEY || (process.env.NODE_ENV !== 'production' ? headerKey : '');
+    if (!apiKey) {
+      return res.status(400).json({ error: 'OPENAI_API_KEY missing. Set server env or send X-OpenAI-Key header in development.' });
+    }
+    const { text, targetLang } = req.body || {};
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Missing text' });
+    }
+    if (!targetLang || typeof targetLang !== 'string') {
+      return res.status(400).json({ error: 'Missing targetLang' });
+    }
+
+    // Map common short codes to language names for better prompts
+    const langMap = { en: 'English', es: 'Spanish', fr: 'French', de: 'German', pt: 'Portuguese', ja: 'Japanese', zh: 'Chinese', it: 'Italian', ms: 'Malay' };
+    const langName = langMap[targetLang.toLowerCase()] || targetLang;
+
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: `You are a translator. Translate the user text into ${langName}. Keep technical terms, operator names, numbers, and country names intact. Respond with translation only.` },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.2
+      })
+    });
+
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      logger.error('Translate error: %s', msg);
+      return res.status(resp.status).json({ error: 'Translation request failed' });
+    }
+    const json = await resp.json();
+    const translated = json?.choices?.[0]?.message?.content?.trim?.() || '';
+    return res.json({ translated });
+  } catch (err) {
+    logger.error('Translate proxy error: %o', err);
+    return res.status(500).json({ error: 'Translate proxy failed' });
+  }
 });
 
 app.get('/server.js', (req, res) => {
@@ -201,7 +343,9 @@ app.get('/api/latency-data', [
   check('operator').optional().isString(),
   check('network_type').optional().isIn(['mobile', 'wifi', 'wired', 'unknown']),
   check('dest_country').optional().isString(),
-  check('dest_region').optional().isString()
+  check('dest_region').optional().isString(),
+  check('start_date').optional().isISO8601(),
+  check('end_date').optional().isISO8601()
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -217,25 +361,33 @@ app.get('/api/latency-data', [
   const network_type = req.query.network_type;
   const dest_country = req.query.dest_country;
   const dest_region = req.query.dest_region;
+  const start_date = req.query.start_date;
+  const end_date = req.query.end_date;
 
   let client;
   try {
     client = await pool.connect();
 
+    // Use date range if provided, otherwise default to last hour
+    const dateCondition = start_date && end_date 
+      ? `ptr."createdAt" >= $1 AND ptr."createdAt" <= $2`
+      : `ptr."createdAt" >= NOW() - INTERVAL '1 hour'`;
+    const dateParams = start_date && end_date ? [start_date, end_date] : [];
+    
     let countQuery = `
       SELECT COUNT(*) as total_count
       FROM public."PingTaskResults" ptr
       INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
       LEFT JOIN public."NetworkInfoExtended" nie ON ptr."networkInfoId" = nie."networkInfoId"
       LEFT JOIN public."IpInfo" ipi ON ptr."networkInfoId" = ipi."networkInfoId"
-      WHERE ptr."createdAt" >= NOW() - INTERVAL '1 hour'
+      WHERE ${dateCondition}
         AND ptr."avgTime" >= 5
         AND ptr."avgTime" <= 800
         AND ptr."networkInfoId" IS NOT NULL
         AND pth."latitude" IS NOT NULL 
         AND pth."longitude" IS NOT NULL
     `;
-    const countParams = [];
+    const countParams = [...dateParams];
     if (source_country) {
       countQuery += ` AND ptr."countryCode" = $${countParams.length + 1}`;
       countParams.push(source_country);
@@ -303,14 +455,14 @@ app.get('/api/latency-data', [
       LEFT JOIN public."NetworkInfoExtended" nie ON ptr."networkInfoId" = nie."networkInfoId"
       LEFT JOIN public."LocationInfo" li ON ptr."networkInfoId" = li."networkInfoId"
       LEFT JOIN public."IpInfo" ipi ON ptr."networkInfoId" = ipi."networkInfoId"
-      WHERE ptr."createdAt" >= NOW() - INTERVAL '1 hour'
+      WHERE ${dateCondition}
         AND ptr."avgTime" >= 5
-        AND ptr."avgTime" <= 800
+        AND ptr."avgTime" <= 2000
         AND ptr."networkInfoId" IS NOT NULL
         AND pth."latitude" IS NOT NULL 
         AND pth."longitude" IS NOT NULL
     `;
-    const dataParams = [];
+    const dataParams = [...dateParams];
     if (source_country) {
       dataQuery += ` AND ptr."countryCode" = $${dataParams.length + 1}`;
       dataParams.push(source_country);
@@ -529,7 +681,7 @@ app.get('/api/aggregated-flows', async (req, res) => {
       INNER JOIN public."IpInfo" src_ip ON ptr."networkInfoId" = src_ip."networkInfoId"
       LEFT JOIN public."LocationInfo" li ON ptr."networkInfoId" = li."networkInfoId"
       WHERE ptr."createdAt" >= NOW() - INTERVAL '10 hour'
-        AND ptr."avgTime" BETWEEN 5 AND 800
+        AND ptr."avgTime" BETWEEN 5 AND 1000
         AND pth."latitude" IS NOT NULL 
         AND pth."longitude" IS NOT NULL
         AND li."latitude" IS NOT NULL
@@ -713,7 +865,7 @@ app.get('/api/latest-test', async (req, res) => {
       LEFT JOIN public."IpInfo" ipi ON ptr."networkInfoId" = ipi."networkInfoId"
       JOIN latest_task lt ON ptr."taskId" = lt.latest_task_id
       WHERE ptr."avgTime" >= 5
-        AND ptr."avgTime" <= 800
+        AND ptr."avgTime" <= 1000
         AND ptr."networkInfoId" IS NOT NULL
         AND pth."latitude" IS NOT NULL 
         AND pth."longitude" IS NOT NULL;
@@ -723,6 +875,203 @@ app.get('/api/latest-test', async (req, res) => {
   } catch (error) {
     logger.error('Error fetching latest test:', error);
     res.status(500).json({ error: 'Failed to fetch latest test' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// NQS: Performance metrics (KPIs over a recent window)
+app.get('/api/nqs/performance-metrics', async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || '24', 10), 168));
+    const whereWindow = `ptr."createdAt" >= NOW() - INTERVAL '${hours} hour'`;
+
+    const q = `
+      WITH base AS (
+        SELECT
+          ptr."avgTime"           AS latency_ms,
+          ptr."avgJitter"         AS jitter_ms,
+          ptr."packetLoss"        AS loss_pct,
+          COALESCE(nie."networkType"::TEXT, 'unknown') AS network_type
+        FROM public."PingTaskResults" ptr
+        INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
+        LEFT JOIN public."NetworkInfoExtended" nie ON ptr."networkInfoId" = nie."networkInfoId"
+        WHERE ${whereWindow}
+          AND ptr."avgTime" BETWEEN 5 AND 800
+          AND pth."latitude" IS NOT NULL AND pth."longitude" IS NOT NULL
+      )
+      SELECT
+        COUNT(*)::INT                               AS total_tests,
+        AVG(latency_ms)::FLOAT                      AS avg_latency,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_latency,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_latency,
+        AVG(jitter_ms)::FLOAT                       AS avg_jitter,
+        AVG(loss_pct)::FLOAT                        AS avg_loss,
+        AVG(CASE WHEN latency_ms <= 300 THEN 1 ELSE 0 END) * 100.0 AS compliance_rate
+      FROM base`;
+
+    const result = await client.query(q);
+    return res.json({ hours, metrics: result.rows?.[0] || null });
+  } catch (error) {
+    logger.error('Error in /api/nqs/performance-metrics: %o', error);
+    res.status(500).json({ error: 'Failed to fetch performance metrics' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// NQS: Geographic distribution (per-country aggregates)
+app.get('/api/nqs/geographic-distribution', async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || '24', 10), 720));
+    const minSamples = Math.max(1, Math.min(parseInt(req.query.min || '10', 10), 10000));
+    const whereWindow = `ptr."createdAt" >= NOW() - INTERVAL '${hours} hour'`;
+
+    const q = `
+      SELECT 
+        ptr."countryCode" AS source_country,
+        COUNT(*)::INT      AS total_tests,
+        AVG(ptr."avgTime")::FLOAT AS avg_latency,
+        AVG(CASE WHEN ptr."avgTime" <= 300 THEN 1 ELSE 0 END) * 100.0 AS compliance_rate,
+        AVG(li."latitude")  AS avg_source_lat,
+        AVG(li."longitude") AS avg_source_lon
+      FROM public."PingTaskResults" ptr
+      INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
+      LEFT JOIN public."LocationInfo" li ON ptr."networkInfoId" = li."networkInfoId"
+      WHERE ${whereWindow}
+        AND ptr."avgTime" BETWEEN 5 AND 800
+        AND pth."latitude" IS NOT NULL AND pth."longitude" IS NOT NULL
+        AND ptr."countryCode" IS NOT NULL
+      GROUP BY ptr."countryCode"
+      HAVING COUNT(*) >= $1
+      ORDER BY total_tests DESC`;
+
+    const result = await client.query(q, [minSamples]);
+    return res.json({ hours, minSamples, countries: result.rows });
+  } catch (error) {
+    logger.error('Error in /api/nqs/geographic-distribution: %o', error);
+    res.status(500).json({ error: 'Failed to fetch geographic distribution' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// NQS: Network performance by type (mobile/wifi/wired/unknown)
+app.get('/api/nqs/network-performance', async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || '24', 10), 720));
+    const whereWindow = `ptr."createdAt" >= NOW() - INTERVAL '${hours} hour'`;
+
+    const q = `
+      SELECT
+        COALESCE(nie."networkType"::TEXT, 'unknown') AS network_type,
+        COUNT(*)::INT                                 AS total_tests,
+        AVG(ptr."avgTime")::FLOAT                    AS avg_latency,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ptr."avgTime") AS p95_latency,
+        AVG(ptr."avgJitter")::FLOAT                  AS avg_jitter,
+        AVG(ptr."packetLoss")::FLOAT                 AS avg_loss,
+        AVG(CASE WHEN ptr."avgTime" <= 300 THEN 1 ELSE 0 END) * 100.0 AS compliance_rate
+      FROM public."PingTaskResults" ptr
+      INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
+      LEFT JOIN public."NetworkInfoExtended" nie ON ptr."networkInfoId" = nie."networkInfoId"
+      WHERE ${whereWindow}
+        AND ptr."avgTime" BETWEEN 5 AND 1000
+        AND pth."latitude" IS NOT NULL AND pth."longitude" IS NOT NULL
+      GROUP BY network_type
+      ORDER BY total_tests DESC`;
+
+    const result = await client.query(q);
+    return res.json({ hours, byType: result.rows });
+  } catch (error) {
+    logger.error('Error in /api/nqs/network-performance: %o', error);
+    res.status(500).json({ error: 'Failed to fetch network performance by type' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// NQS: Time series (hourly aggregates)
+app.get('/api/nqs/time-series', async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || '24', 10), 720));
+    const whereWindow = `ptr."createdAt" >= NOW() - INTERVAL '${hours} hour'`;
+
+    const q = `
+      SELECT
+        date_trunc('hour', ptr."createdAt") AS hour,
+        COUNT(*)::INT                         AS total_tests,
+        AVG(ptr."avgTime")::FLOAT            AS avg_latency,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ptr."avgTime") AS p95_latency,
+        AVG(ptr."avgJitter")::FLOAT          AS avg_jitter,
+        AVG(ptr."packetLoss")::FLOAT         AS avg_loss,
+        AVG(CASE WHEN ptr."avgTime" <= 300 THEN 1 ELSE 0 END) * 100.0 AS compliance_rate
+      FROM public."PingTaskResults" ptr
+      INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
+      WHERE ${whereWindow}
+        AND ptr."avgTime" BETWEEN 5 AND 800
+        AND pth."latitude" IS NOT NULL AND pth."longitude" IS NOT NULL
+      GROUP BY 1
+      ORDER BY hour ASC`;
+
+    const result = await client.query(q);
+    return res.json({ hours, series: result.rows });
+  } catch (error) {
+    logger.error('Error in /api/nqs/time-series: %o', error);
+    res.status(500).json({ error: 'Failed to fetch time series' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// NQS: Top performers (best routes by latency)
+app.get('/api/nqs/top-performers', async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || '24', 10), 720));
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit || '50', 10), 500));
+    const whereWindow = `ptr."createdAt" >= NOW() - INTERVAL '${hours} hour'`;
+
+    const q = `
+      SELECT 
+        ptr."countryCode" AS source_country,
+        pth."country"     AS dest_country,
+        COALESCE(nie."networkType"::TEXT, 'unknown') AS network_type,
+        ptr."operator"    AS operator,
+        AVG(ptr."avgTime")::FLOAT AS avg_latency,
+        COUNT(*)::INT      AS samples,
+        AVG(CASE WHEN ptr."avgTime" <= 300 THEN 1 ELSE 0 END) * 100.0 AS compliance_rate,
+        AVG(li."latitude")  AS avg_source_lat,
+        AVG(li."longitude") AS avg_source_lon,
+        AVG(pth."latitude") AS avg_dest_lat,
+        AVG(pth."longitude") AS avg_dest_lon
+      FROM public."PingTaskResults" ptr
+      INNER JOIN public."PingTestHosts" pth ON ptr."ipAddress" = pth."ipAddress"
+      LEFT JOIN public."NetworkInfoExtended" nie ON ptr."networkInfoId" = nie."networkInfoId"
+      LEFT JOIN public."LocationInfo" li ON ptr."networkInfoId" = li."networkInfoId"
+      WHERE ${whereWindow}
+        AND ptr."avgTime" BETWEEN 5 AND 800
+        AND pth."latitude" IS NOT NULL AND pth."longitude" IS NOT NULL
+        AND ptr."countryCode" IS NOT NULL
+        AND pth."country" IS NOT NULL
+      GROUP BY 1,2,3,4
+      HAVING COUNT(*) >= 10
+      ORDER BY avg_latency ASC, compliance_rate DESC
+      LIMIT $1`;
+
+    const result = await client.query(q, [limit]);
+    return res.json({ hours, limit, routes: result.rows });
+  } catch (error) {
+    logger.error('Error in /api/nqs/top-performers: %o', error);
+    res.status(500).json({ error: 'Failed to fetch top performers' });
   } finally {
     if (client) client.release();
   }
@@ -889,7 +1238,7 @@ app.get('/api/hourly-issues', async (req, res) => {
     client = await pool.connect();
 
     const query = `
-      WITH window AS (
+      WITH time_window AS (
         SELECT date_trunc('hour', now()) - interval '3 hours' AS start_ts
       ),
       base AS (
@@ -923,7 +1272,7 @@ app.get('/api/hourly-issues', async (req, res) => {
           COALESCE(h."avgPacketLoss", h."avgLoss") AS loss_pct,  -- already in %
           COALESCE(h."outlierCount"::float / NULLIF(h."sampleCount",0), 0) AS outlier_ratio
         FROM "HourlyLatencyAggregate" h
-        JOIN window w ON h.hour >= w.start_ts
+        JOIN time_window w ON h.hour >= w.start_ts
       ),
 
       geo AS (

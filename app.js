@@ -32,34 +32,34 @@ const initApp = async () => {
     // Now Three.js is available
     console.log('Three.js version:', THREE.REVISION);
 
-const CONFIG = {
+const CONFIG = (typeof window !== 'undefined' && window.CONFIG) ? window.CONFIG : {
   radius: 5,
   batchSize: 500, // Increased batch size
   batchInterval: 300, // Faster processing
   fetchBatchSize: 3000, // Much larger fetch batches
-  maxActiveArcs: 1000, // Increased to 1000 as requested
-  arcDuration: 6000,
-  arcFadeTime: 1000,
-  traceTime: 6000,
+  maxActiveArcs: 450, // reduce on-screen lines
+  arcDuration: 4500,
+  arcFadeTime: 1500,
+  traceTime: 3000,
   debug: true,
   statsDataLimit: 100000, // Increased for larger datasets
   animationBatchSize: 500, // Larger animation batches
   animationBatchInterval: 300, // Faster animation processing
   latencyThresholds: {
     excellent: 100,
-    good: 100,
-    average: 200,
-    poor: 300,
-    bad: 400,
+    good: 200,
+    average: 300,
+    poor: Infinity,
+    bad: Infinity,
     terrible: Infinity
   },
   colors: {
-    excellent: 0x005a00,
-    good: 0x038103,
-    average: 0xbe8c00,
-    poor: 0xec6f09,
-    bad: 0xa51f1f,
-    terrible: 0xc04545
+    excellent: 0x348939, // green
+    good: 0xfdbf02,      // yellow
+    average: 0xfe7e03,   // amber
+    poor: 0x9b1d1e,      // red
+    bad: 0x9b1d1e,       // red (same)
+    terrible: 0x9b1d1e   // red (same)
   },
   highlightThreshold: 400,
   arcHeightFactor: 0.08,
@@ -68,10 +68,12 @@ const CONFIG = {
   pointSize: 3.0,
   dotSize: 8.0,
   starfieldRadius: 100, // Base radius for starfield positioning
-  arcSegments: 100
+  arcSegments: 100,
+  qualooPalette: [0x00ffff, 0xffa500, 0x8000ff, 0xff00ff]
 };
 
-const OPENAI_API_KEY = window.OPENAI_API_KEY || '';
+// Initialize OpenAI API key from window or localStorage (runtime-configurable)
+window.OPENAI_API_KEY = window.OPENAI_API_KEY || (typeof localStorage !== 'undefined' ? localStorage.getItem('OPENAI_API_KEY') : '') || '';
 
 const continentCodeToName = {
   'AF': 'Africa',
@@ -396,7 +398,9 @@ const state = {
     operator: '',
     network_type: '',
     dest_country: '',
-    dest_region: ''
+    dest_region: '',
+    start_date: '',
+    end_date: ''
   },
   complianceMode: false,
   viewMode: 'latency', // Initialize view mode (latency or compliance)
@@ -405,7 +409,11 @@ const state = {
   lastTickerUpdate: 0,
   lastTestId: null,
   logoSprite: null,
-  activeFilterKey: ''
+  activeFilterKey: '',
+  // Fun modes
+  qualooColorsMode: false,
+  qualooColorIndex: 0,
+  musicSyncMode: false
 };
 
 let tickerQueue = [];
@@ -462,14 +470,26 @@ const checkWebGL = () => {
 };
 
 const getLatencyColor = (ms) => {
-  const thresholds = CONFIG.latencyThresholds;
-  const colors = CONFIG.colors;
-  if (ms < thresholds.excellent) return colors.excellent;
-  if (ms < thresholds.good) return colors.good;
-  if (ms < thresholds.average) return colors.average;
-  if (ms < thresholds.poor) return colors.poor;
-  if (ms < thresholds.bad) return colors.bad;
-  return colors.terrible;
+  const cfg = (typeof window !== 'undefined' && window.CONFIG) ? window.CONFIG : CONFIG;
+  const thresholds = cfg.latencyThresholds || CONFIG.latencyThresholds;
+  const palette = cfg.colors || CONFIG.colors;
+  const parse = (c) => {
+    if (typeof c === 'string' && /^#?[0-9a-fA-F]{6}$/.test(c)) {
+      const hex = c.startsWith('#') ? c : `#${c}`;
+      return new THREE.Color(hex).getHex();
+    }
+    if (typeof c === 'number') return c;
+    return 0xffffff;
+  };
+  if (ms < thresholds.excellent) return parse(palette.excellent);
+  if (ms < thresholds.good) return parse(palette.good);
+  if (ms < thresholds.average) return parse(palette.average);
+  // Fallbacks if only 4 buckets are defined
+  if (thresholds.poor !== undefined && palette.poor !== undefined) {
+    if (ms < thresholds.poor) return parse(palette.poor);
+  }
+  const fallback = palette.poor || palette.bad || palette.terrible || 0xff0000;
+  return parse(fallback);
 };
 
 const createCircleTexture = (size = 32) => {
@@ -485,6 +505,525 @@ const createCircleTexture = (size = 32) => {
   texture.needsUpdate = true;
   return texture;
 };
+// Create historical data filters panel
+function createHistoricalFiltersPanel() {
+  // Check if panel already exists
+  if (document.getElementById('historical-filters-panel')) return;
+  
+  const panel = document.createElement('div');
+  panel.id = 'historical-filters-panel';
+  panel.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    padding: 20px;
+    background: linear-gradient(135deg, rgba(0,0,0,0.95), rgba(10,20,30,0.98));
+    border-radius: 12px;
+    border: 2px solid rgba(124,58,237,0.5);
+    box-shadow: 0 8px 32px rgba(124,58,237,0.3);
+    z-index: 99999;
+    font-family: 'Orbitron', monospace;
+    min-width: 350px;
+    backdrop-filter: blur(10px);
+    max-height: 80vh;
+    overflow-y: auto;
+    display: none;
+  `;
+  
+  panel.innerHTML = `
+    <div style="color: #a855f7; font-size: 16px; font-weight: bold; margin-bottom: 15px; text-align: center;">
+      🕒 HISTORICAL DATA FILTERS
+    </div>
+    
+    <div style="margin-bottom: 15px;">
+      <label style="color: #add8e6; font-size: 12px; display: block; margin-bottom: 5px;">Date Range:</label>
+      <div style="display: flex; gap: 10px; margin-bottom: 5px;">
+        <div style="flex: 1;">
+          <label style="color: #888; font-size: 10px;">From:</label>
+          <input type="datetime-local" id="filter-start-date" style="width: 100%; padding: 8px; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: white; font-family: 'Orbitron', monospace; font-size: 11px;" />
+        </div>
+        <div style="flex: 1;">
+          <label style="color: #888; font-size: 10px;">To:</label>
+          <input type="datetime-local" id="filter-end-date" style="width: 100%; padding: 8px; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: white; font-family: 'Orbitron', monospace; font-size: 11px;" />
+        </div>
+      </div>
+      <div style="display: flex; gap: 5px; margin-top: 5px;">
+        <button id="filter-last-hour" style="flex: 1; padding: 4px; background: rgba(0,229,255,0.2); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: #00e5ff; cursor: pointer; font-size: 10px;">Last Hour</button>
+        <button id="filter-last-24h" style="flex: 1; padding: 4px; background: rgba(0,229,255,0.2); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: #00e5ff; cursor: pointer; font-size: 10px;">Last 24h</button>
+        <button id="filter-last-week" style="flex: 1; padding: 4px; background: rgba(0,229,255,0.2); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: #00e5ff; cursor: pointer; font-size: 10px;">Last Week</button>
+      </div>
+    </div>
+    
+    <div style="margin-bottom: 15px;">
+      <label style="color: #add8e6; font-size: 12px; display: block; margin-bottom: 5px;">Source Country:</label>
+      <select id="filter-source-country" style="width: 100%; padding: 8px; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: white; font-family: 'Orbitron', monospace; font-size: 12px;">
+        <option value="">All Countries</option>
+      </select>
+    </div>
+    
+    <div style="margin-bottom: 15px;">
+      <label style="color: #add8e6; font-size: 12px; display: block; margin-bottom: 5px;">Destination Country:</label>
+      <select id="filter-dest-country" style="width: 100%; padding: 8px; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: white; font-family: 'Orbitron', monospace; font-size: 12px;">
+        <option value="">All Countries</option>
+      </select>
+    </div>
+    
+    <div style="display: flex; gap: 10px;">
+      <button id="apply-filters" style="flex: 1; padding: 12px; background: linear-gradient(45deg, #00e5ff, #00b0cc); border: none; border-radius: 8px; color: black; font-weight: bold; cursor: pointer; font-size: 14px; box-shadow: 0 4px 15px rgba(0,229,255,0.3);">
+        Apply Filters
+      </button>
+      <button id="clear-filters" style="flex: 1; padding: 12px; background: linear-gradient(45deg, #ff6b6b, #ee5a52); border: none; border-radius: 8px; color: white; font-weight: bold; cursor: pointer; font-size: 14px; box-shadow: 0 4px 15px rgba(255,107,107,0.3);">
+        Clear All
+      </button>
+    </div>
+    
+    <button id="toggle-filters-panel" style="margin-top: 10px; width: 100%; padding: 8px; background: rgba(255,255,255,0.1); border: 1px solid rgba(0,229,255,0.3); border-radius: 4px; color: #888; cursor: pointer; font-size: 11px;">
+      Hide Filters
+    </button>
+  `;
+  
+  document.body.appendChild(panel);
+  
+  // Populate country dropdowns
+  const sourceSelect = document.getElementById('filter-source-country');
+  const destSelect = document.getElementById('filter-dest-country');
+  
+  const countries = Object.entries(window.countryCodeToName || {})
+    .sort((a, b) => a[1].localeCompare(b[1]));
+  
+  countries.forEach(([code, name]) => {
+    const sourceOption = document.createElement('option');
+    sourceOption.value = code;
+    sourceOption.textContent = name;
+    sourceSelect.appendChild(sourceOption);
+    
+    const destOption = document.createElement('option');
+    destOption.value = code;
+    destOption.textContent = name;
+    destSelect.appendChild(destOption);
+  });
+  
+  // Quick date range buttons
+  document.getElementById('filter-last-hour').addEventListener('click', () => {
+    const end = new Date();
+    const start = new Date(end.getTime() - 60 * 60 * 1000);
+    document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+    document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+  });
+  
+  document.getElementById('filter-last-24h').addEventListener('click', () => {
+    const end = new Date();
+    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+    document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+    document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+  });
+  
+  document.getElementById('filter-last-week').addEventListener('click', () => {
+    const end = new Date();
+    const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+    document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+    document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+  });
+  
+  // Apply filters
+  document.getElementById('apply-filters').addEventListener('click', () => {
+    console.log('🔍 Apply filters button clicked!');
+    
+    const startDate = document.getElementById('filter-start-date').value;
+    const endDate = document.getElementById('filter-end-date').value;
+    const sourceCountry = document.getElementById('filter-source-country').value;
+    const destCountry = document.getElementById('filter-dest-country').value;
+    
+    console.log('📅 Raw form values:', { startDate, endDate, sourceCountry, destCountry });
+    
+    state.filters.start_date = startDate ? new Date(startDate).toISOString() : '';
+    state.filters.end_date = endDate ? new Date(endDate).toISOString() : '';
+    state.filters.source_country = sourceCountry;
+    state.filters.dest_country = destCountry;
+    
+    console.log('🔍 Applying filters:', state.filters);
+    console.log('🌍 About to call fetchAllData with filters');
+    
+    // Clear current data and fetch with filters
+    clearArcs();
+    state.allDataForStats = [];
+    
+    try {
+      fetchAllData(state.filters);
+      console.log('✅ fetchAllData called successfully');
+    } catch (error) {
+      console.error('❌ Error calling fetchAllData:', error);
+    }
+    
+    speakQueued(`Fetching historical data ${startDate ? 'from ' + new Date(startDate).toLocaleDateString() : ''} ${endDate ? 'to ' + new Date(endDate).toLocaleDateString() : ''}`, window.TTS_PRIORITY.INFO);
+  });
+  
+  // Clear filters
+  document.getElementById('clear-filters').addEventListener('click', () => {
+    document.getElementById('filter-start-date').value = '';
+    document.getElementById('filter-end-date').value = '';
+    document.getElementById('filter-source-country').value = '';
+    document.getElementById('filter-dest-country').value = '';
+    
+    state.filters.start_date = '';
+    state.filters.end_date = '';
+    state.filters.source_country = '';
+    state.filters.dest_country = '';
+    
+    console.log('🔍 Filters cleared');
+    
+    // Fetch latest data with cleared filters
+    clearArcs();
+    state.allDataForStats = [];
+    fetchAllData(state.filters);
+    
+    speakQueued('Filters cleared. Showing live data.', window.TTS_PRIORITY.INFO);
+  });
+  
+  // Toggle panel visibility
+  document.getElementById('toggle-filters-panel').addEventListener('click', () => {
+    const content = panel.querySelectorAll('div, button');
+    const toggleBtn = document.getElementById('toggle-filters-panel');
+    const isHidden = toggleBtn.textContent === 'Show Filters';
+    
+    content.forEach((el, i) => {
+      if (i < content.length - 1) { // Don't hide the toggle button itself
+        el.style.display = isHidden ? 'block' : 'none';
+      }
+    });
+    
+    toggleBtn.textContent = isHidden ? 'Hide Filters' : 'Show Filters';
+    panel.style.minWidth = isHidden ? '350px' : 'auto';
+  });
+  
+  console.log('✅ Historical filters panel created');
+}
+
+// Create a floating button to access time filters
+function createTimeFiltersButton() {
+  if (document.getElementById('time-filters-button')) return;
+  
+  const button = document.createElement('button');
+  button.id = 'time-filters-button';
+  button.textContent = '🕒 TIME FILTERS';
+  button.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 15px 25px;
+    background: linear-gradient(45deg, #7c3aed, #a855f7);
+    color: white;
+    border: 2px solid rgba(168, 85, 247, 0.5);
+    border-radius: 12px;
+    font-family: 'Orbitron', monospace;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    z-index: 9999;
+    box-shadow: 0 4px 15px rgba(124, 58, 237, 0.4);
+    transition: all 0.3s ease;
+  `;
+  
+  button.onmouseover = () => {
+    button.style.transform = 'translateY(-2px) scale(1.05)';
+    button.style.boxShadow = '0 6px 20px rgba(124, 58, 237, 0.6)';
+  };
+  
+  button.onmouseout = () => {
+    button.style.transform = 'translateY(0) scale(1)';
+    button.style.boxShadow = '0 4px 15px rgba(124, 58, 237, 0.4)';
+  };
+  
+  button.onclick = () => {
+    const panel = document.getElementById('historical-filters-panel');
+    if (panel) {
+      const isHidden = panel.style.display === 'none';
+      panel.style.display = isHidden ? 'block' : 'none';
+      button.textContent = isHidden ? '🕒 HIDE FILTERS' : '🕒 TIME FILTERS';
+      button.style.background = isHidden 
+        ? 'linear-gradient(45deg, #ef4444, #dc2626)' 
+        : 'linear-gradient(45deg, #7c3aed, #a855f7)';
+    }
+  };
+  
+  document.body.appendChild(button);
+  console.log('✅ Time filters button created');
+}
+
+function addDebugControls() {
+  try {
+    const menu = document.getElementById('menu');
+    if (!menu || document.getElementById('debug-controls')) return;
+    const wrap = document.createElement('div');
+    wrap.id = 'debug-controls';
+    wrap.style.display = 'inline-flex';
+    wrap.style.alignItems = 'center';
+    wrap.style.gap = '6px';
+    wrap.style.marginLeft = '10px';
+
+    // Tone mapping selector
+    const tmLabel = document.createElement('span');
+    tmLabel.textContent = 'ToneMap';
+    tmLabel.style.fontFamily = 'Orbitron, sans-serif';
+    tmLabel.style.fontSize = '12px';
+    tmLabel.style.color = '#add8e6';
+    const tm = document.createElement('select');
+    tm.style.fontFamily = 'Orbitron, sans-serif';
+    ['NoToneMapping','LinearToneMapping','ReinhardToneMapping','CineonToneMapping','ACESFilmicToneMapping'].forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name.replace('ToneMapping','');
+      tm.appendChild(opt);
+    });
+    tm.value = 'NoToneMapping';
+    tm.onchange = () => {
+      if (!state.renderer) return;
+      const map = {
+        NoToneMapping: THREE.NoToneMapping,
+        LinearToneMapping: THREE.LinearToneMapping,
+        ReinhardToneMapping: THREE.ReinhardToneMapping,
+        CineonToneMapping: THREE.CineonToneMapping,
+        ACESFilmicToneMapping: THREE.ACESFilmicToneMapping
+      };
+      state.renderer.toneMapping = map[tm.value] || THREE.NoToneMapping;
+      state.renderer.toneMappingExposure = parseFloat(exp.value || '1.0');
+    };
+
+    const expLabel = document.createElement('span');
+    expLabel.textContent = 'Renderer Exposure';
+    expLabel.style.fontFamily = 'Orbitron, sans-serif';
+    expLabel.style.fontSize = '12px';
+    expLabel.style.color = '#add8e6';
+    const exp = document.createElement('input');
+    exp.type = 'range'; exp.min = '0.5'; exp.max = '3.0'; exp.step = '0.05';
+    exp.value = String(state.renderer?.toneMappingExposure || 2.2);
+    exp.oninput = () => {
+      if (state.renderer) state.renderer.toneMappingExposure = parseFloat(exp.value);
+    };
+
+    // Lit/unlit toggle
+    const litBtn = document.createElement('button');
+    litBtn.textContent = state.litMode ? 'Globe Shading: On' : 'Globe Shading: Off';
+    litBtn.style.background = 'rgba(255,255,255,0.2)';
+    litBtn.style.color = 'white';
+    litBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+    litBtn.style.padding = '4px 8px';
+    litBtn.style.cursor = 'pointer';
+    litBtn.style.fontFamily = 'Orbitron, sans-serif';
+    litBtn.onclick = () => {
+      const next = !state.litMode;
+      setLitMode(next);
+      litBtn.textContent = next ? 'Globe Shading: On' : 'Globe Shading: Off';
+    };
+
+    // Bump toggle and scale
+    const bumpLabel = document.createElement('span');
+    bumpLabel.textContent = 'Bump (Relief)';
+    bumpLabel.style.fontFamily = 'Orbitron, sans-serif';
+    bumpLabel.style.fontSize = '12px';
+    bumpLabel.style.color = '#add8e6';
+    const bump = document.createElement('input');
+    bump.type = 'checkbox'; bump.checked = !!state.globe?.material?.bumpMap;
+    bump.onchange = () => {
+      if (!state.globe) return;
+      const has = bump.checked;
+      if (has && state.globe.material && 'bumpMap' in state.globe.material) {
+        state.globe.material.bumpMap = state.earthTextures?.bump || null;
+      } else if (state.globe.material && 'bumpMap' in state.globe.material) {
+        state.globe.material.bumpMap = null;
+      }
+      state.globe.material.needsUpdate = true;
+    };
+    const bumpScale = document.createElement('input');
+    bumpScale.type = 'range'; bumpScale.min = '0'; bumpScale.max = '0.2'; bumpScale.step = '0.005';
+    bumpScale.value = String(state.globe?.material?.bumpScale ?? 0.025);
+    bumpScale.oninput = () => { if (state.globe?.material && 'bumpScale' in state.globe.material) state.globe.material.bumpScale = parseFloat(bumpScale.value); };
+
+    // Specular/Roughness controls (Phong specular as proxy, and material color multiplier)
+    const specLabel = document.createElement('span');
+    specLabel.textContent = 'Specular';
+    specLabel.style.fontFamily = 'Orbitron, sans-serif';
+    specLabel.style.fontSize = '12px';
+    specLabel.style.color = '#add8e6';
+    const spec = document.createElement('input');
+    spec.type = 'range'; spec.min = '0'; spec.max = '1'; spec.step = '0.01';
+    spec.value = '0.4';
+    spec.oninput = () => {
+      if (state.globe?.material && 'specular' in state.globe.material) {
+        state.globe.material.specular = new THREE.Color(parseFloat(spec.value), parseFloat(spec.value), parseFloat(spec.value));
+      }
+    };
+
+    const shinLabel = document.createElement('span'); shinLabel.textContent = 'Shininess'; shinLabel.style.fontFamily = 'Orbitron, sans-serif'; shinLabel.style.fontSize = '12px'; shinLabel.style.color = '#add8e6';
+    const shin = document.createElement('input'); shin.type = 'range'; shin.min = '0'; shin.max = '64'; shin.step = '1'; shin.value = '12';
+    shin.oninput = () => { if (state.globe?.material && 'shininess' in state.globe.material) state.globe.material.shininess = parseFloat(shin.value); };
+
+    const colorGainLabel = document.createElement('span'); colorGainLabel.textContent = 'Texture Gain'; colorGainLabel.style.fontFamily = 'Orbitron, sans-serif'; colorGainLabel.style.fontSize = '12px'; colorGainLabel.style.color = '#add8e6';
+    const colorGain = document.createElement('input'); colorGain.type = 'range'; colorGain.min = '0.5'; colorGain.max = '2.0'; colorGain.step = '0.05'; colorGain.value = '1.0';
+    colorGain.oninput = () => {
+      if (!state.globe?.material) return;
+      const gain = parseFloat(colorGain.value);
+      if (state.globe.material.color) state.globe.material.color.setRGB(gain, gain, gain);
+    };
+
+    const ambLabel = document.createElement('span');
+    ambLabel.textContent = 'Ambient Light (I)';
+    ambLabel.style.fontFamily = 'Orbitron, sans-serif';
+    ambLabel.style.fontSize = '12px';
+    ambLabel.style.color = '#add8e6';
+    const amb = document.createElement('input');
+    amb.type = 'range'; amb.min = '0'; amb.max = '3'; amb.step = '0.05';
+    amb.value = state.lights?.ambient?.intensity != null ? String(state.lights.ambient.intensity) : '0.9';
+    amb.oninput = () => { if (state.lights?.ambient) state.lights.ambient.intensity = parseFloat(amb.value); };
+
+    const sunLabel = document.createElement('span');
+    sunLabel.textContent = 'Sun Light (I)';
+    sunLabel.style.fontFamily = 'Orbitron, sans-serif';
+    sunLabel.style.fontSize = '12px';
+    sunLabel.style.color = '#add8e6';
+    const sun = document.createElement('input');
+    sun.type = 'range'; sun.min = '0'; sun.max = '6'; sun.step = '0.1';
+    sun.value = state.lights?.sun?.intensity != null ? String(state.lights.sun.intensity) : '3.0';
+    sun.oninput = () => { if (state.lights?.sun) state.lights.sun.intensity = parseFloat(sun.value); };
+
+    const fillLabel = document.createElement('span');
+    fillLabel.textContent = 'Fill Light (I)';
+    fillLabel.style.fontFamily = 'Orbitron, sans-serif';
+    fillLabel.style.fontSize = '12px';
+    fillLabel.style.color = '#add8e6';
+    const fill = document.createElement('input');
+    fill.type = 'range'; fill.min = '0'; fill.max = '4'; fill.step = '0.1';
+    fill.value = state.lights?.fill?.intensity != null ? String(state.lights.fill.intensity) : '1.8';
+    fill.oninput = () => { if (state.lights?.fill) state.lights.fill.intensity = parseFloat(fill.value); };
+
+    const hemiLabel = document.createElement('span');
+    hemiLabel.textContent = 'Hemi Light (I)';
+    hemiLabel.style.fontFamily = 'Orbitron, sans-serif';
+    hemiLabel.style.fontSize = '12px';
+    hemiLabel.style.color = '#add8e6';
+    const hemi = document.createElement('input');
+    hemi.type = 'range'; hemi.min = '0'; hemi.max = '3'; hemi.step = '0.05';
+    hemi.value = state.lights?.hemi?.intensity != null ? String(state.lights.hemi.intensity) : '1.2';
+    hemi.oninput = () => { if (state.lights?.hemi) state.lights.hemi.intensity = parseFloat(hemi.value); };
+
+    // Sun position controls
+    const sunX = document.createElement('input'); sunX.type = 'range'; sunX.min = '-20'; sunX.max = '20'; sunX.step = '0.5'; sunX.value = String(state.lights?.sun?.position.x ?? 8);
+    const sunY = document.createElement('input'); sunY.type = 'range'; sunY.min = '-20'; sunY.max = '20'; sunY.step = '0.5'; sunY.value = String(state.lights?.sun?.position.y ?? 5);
+    const sunZ = document.createElement('input'); sunZ.type = 'range'; sunZ.min = '-20'; sunZ.max = '20'; sunZ.step = '0.5'; sunZ.value = String(state.lights?.sun?.position.z ?? 3);
+    ;[sunX,sunY,sunZ].forEach(() => {});
+    sunX.oninput = () => { if (state.lights?.sun) state.lights.sun.position.x = parseFloat(sunX.value); };
+    sunY.oninput = () => { if (state.lights?.sun) state.lights.sun.position.y = parseFloat(sunY.value); };
+    sunZ.oninput = () => { if (state.lights?.sun) state.lights.sun.position.z = parseFloat(sunZ.value); };
+
+    wrap.append(tmLabel, tm, expLabel, exp, litBtn, bumpLabel, bump, bumpScale, specLabel, spec, shinLabel, shin, colorGainLabel, colorGain, ambLabel, amb, sunLabel, sun, fillLabel, fill, hemiLabel, hemi, sunX, sunY, sunZ);
+    menu.appendChild(wrap);
+
+    // Keep debug minimal now
+  } catch (e) { console.warn('addDebugControls failed', e); }
+}
+
+// Cinematic/ATC removed per simplification
+
+// Simple Mode: remove all layers/lights and use a single unlit texture
+function enableSimpleMode() {
+  try {
+    // Turn off cinematic and remove layers
+    if (state.cinematic?.enabled) disableCinematicMode();
+    try {
+      if (state.scene) {
+        (state.scene.children || []).forEach(child => {
+          if (child?.userData?.layer === 'atmosphere' || child?.userData?.layer === 'clouds') {
+            state.scene.remove(child);
+          }
+        });
+      }
+    } catch {}
+
+    // Remove lights
+    if (state.lights) {
+      Object.values(state.lights).forEach(l => { if (l && state.scene) state.scene.remove(l); });
+      state.lights = null;
+    }
+
+    // Renderer and scene baseline
+    if (state.renderer) {
+      if ('outputColorSpace' in state.renderer) state.renderer.outputColorSpace = THREE.SRGBColorSpace; else state.renderer.outputEncoding = THREE.sRGBEncoding;
+      state.renderer.toneMapping = THREE.NoToneMapping;
+      state.renderer.toneMappingExposure = 1.0;
+      state.renderer.setClearColor(0x000000, 1);
+    }
+    if (state.scene) {
+      state.scene.background = null;
+      state.scene.environment = null;
+      state.scene.fog = null;
+    }
+
+    // Globe material: pure unlit, true-color
+    if (state.globe) {
+      const currentMap = state.earthTextures?.day || state.globe.material?.map || null;
+      const basic = new THREE.MeshBasicMaterial({ map: currentMap || null, side: THREE.FrontSide, toneMapped: false });
+      state.globe.material.dispose?.();
+      state.globe.material = basic;
+      state.globe.material.needsUpdate = true;
+    }
+
+    state.simpleMode = true;
+    speakQueued('Simple mode enabled. Clean, unlit globe with no layers.', window.TTS_PRIORITY.INFO);
+  } catch (e) {
+    console.error('enableSimpleMode failed', e);
+  }
+}
+
+function toggleSimpleMode() {
+  if (state.simpleMode) {
+    // No-op: remain simple until other modes are enabled
+    speakQueued('Simple mode is active. Use Cinematic or Lights to exit.', window.TTS_PRIORITY.INFO);
+  } else {
+    enableSimpleMode();
+  }
+}
+
+// Scene-wide lighting helpers for brightening analysis mode
+function ensureLights() {
+  // Strip all lights; unlit mode only
+  if (!state.scene) return;
+  try {
+    (state.scene.children || []).forEach(obj => {
+      if (obj && (obj.isLight || obj.type?.includes('Light'))) state.scene.remove(obj);
+    });
+  } catch {}
+  state.lights = null;
+}
+
+// Apply user's simple lighting preset
+function applySimpleLights() {
+  if (!state.scene) return;
+  // Remove previous lights if any
+  try {
+    if (state.lights) {
+      Object.values(state.lights).forEach(l => {
+        if (l && state.scene) state.scene.remove(l);
+      });
+    }
+  } catch {}
+
+  const ambient = new THREE.AmbientLight(0xffffff, 0.3);
+  const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+  dir.position.set(5, 10, 5);
+  state.scene.add(ambient);
+  state.scene.add(dir);
+  state.lights = { ambient, sun: dir };
+}
+
+function setLitMode(enabled) {
+  // Force unlit mode always
+  if (!state.globe) return;
+  const currentMap = state.globe.material?.map || state.earthTextures?.day || null;
+  const basic = new THREE.MeshBasicMaterial({ map: currentMap || null, side: THREE.FrontSide, toneMapped: false });
+  state.globe.material.dispose?.();
+  state.globe.material = basic;
+  state.globe.material.needsUpdate = true;
+  state.litMode = false;
+}
 
 const initThreeJS = (container) => {
   try {
@@ -513,6 +1052,7 @@ const initThreeJS = (container) => {
     state.scene = new THREE.Scene();
     console.log('Scene created:', state.scene);
     state.scene.background = null;
+    state.scene.fog = null;
 
     const aspect = state.threeContainer.clientWidth / state.threeContainer.clientHeight;
     state.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 2000);
@@ -520,21 +1060,34 @@ const initThreeJS = (container) => {
     state.camera.lookAt(0, 0, 0);
     console.log('Camera initialized:', state.camera);
 
-    state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     console.log('Renderer initialized:', state.renderer);
     state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     state.renderer.setSize(state.threeContainer.clientWidth, state.threeContainer.clientHeight);
     state.renderer.shadowMap.enabled = false;
     state.renderer.sortObjects = false;
 
-    // Set a very dark background to make stars more visible
-    state.renderer.setClearColor(0x000011, 1); // Very dark blue-black background
+    // Ensure correct color space and disable tone mapping to avoid global dimming
+    try {
+      if ('outputColorSpace' in state.renderer) {
+        state.renderer.outputColorSpace = THREE.SRGBColorSpace;
+      } else if ('outputEncoding' in state.renderer) {
+        state.renderer.outputEncoding = THREE.sRGBEncoding;
+      }
+      state.renderer.toneMapping = THREE.NoToneMapping;
+      state.renderer.toneMappingExposure = 1.0;
+    } catch (e) {
+      console.warn('Tone mapping setup failed:', e);
+    }
+
+    // Opaque background to avoid blend/dimming from page
+    state.renderer.setClearColor(0x000000, 1);
 
     const canvas = state.renderer.domElement;
     if (!canvas) throw new Error('Canvas creation failed');
     canvas.style.display = 'block';
     canvas.style.position = 'absolute';
-    canvas.style.zIndex = '1';
+    canvas.style.zIndex = '10';
     state.threeContainer.innerHTML = '';
     state.threeContainer.appendChild(canvas);
     console.log('Canvas appended to container:', { canvas, style: canvas.style });
@@ -542,29 +1095,10 @@ const initThreeJS = (container) => {
     state.circleTexture = createCircleTexture();
     console.log('Circle texture created for particles');
 
-    const ambientLight = new THREE.AmbientLight(0x808080, 1.8);
-    state.scene.add(ambientLight);
-    console.log('Ambient light added');
+    // Remove all lights for pure unlit rendering
+    // (Globe uses MeshBasicMaterial, so lights are unnecessary.)
 
-    const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
-    sunLight.position.set(10, 10, 10);
-    state.scene.add(sunLight);
-    console.log('Sun light added');
-
-    const backLight = new THREE.DirectionalLight(0xffffff, 1.2);
-    backLight.position.set(-10, -10, -10);
-    state.scene.add(backLight);
-    console.log('Back light added');
-
-    const fillLight = new THREE.DirectionalLight(0xffffff, 0.6);
-    fillLight.position.set(0, -10, 10);
-    state.scene.add(fillLight);
-    console.log('Fill light added');
-
-    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.1);
-    hemiLight.position.set(0, 20, 0);
-    state.scene.add(hemiLight);
-    console.log('Hemisphere light added');
+    // No lights stored in simplified mode
 
     // Initialize OrbitControls - try multiple ways to access it
     let OrbitControls;
@@ -593,15 +1127,42 @@ const initThreeJS = (container) => {
     document.addEventListener('keydown', toggleDayNight);
     console.log('Keydown event listener added for toggle');
 
-    const testGeometry = new THREE.BoxGeometry(1, 1, 1);
-    const testMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
-    const testCube = new THREE.Mesh(testGeometry, testMaterial);
-    testCube.position.set(0, 0, 0);
-    state.scene.add(testCube);
-    console.log('Test cube added to scene');
+    // No test geometry in simplified view
 
     state.renderer.render(state.scene, state.camera);
     console.log('Initial render forced');
+
+    // Unlit by default; add Cinematic toggle in menu for clouds/cables
+    try { enableSimpleMode(); } catch {}
+    const menu = document.getElementById('menu');
+    if (menu && !document.getElementById('btn-cinematic')) {
+      const cinematicBtn = document.createElement('button');
+      cinematicBtn.id = 'btn-cinematic';
+      cinematicBtn.textContent = 'Cinematic Mode';
+      cinematicBtn.style.background = 'rgba(255,255,255,0.2)';
+      cinematicBtn.style.color = 'white';
+      cinematicBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+      cinematicBtn.style.padding = '5px 10px';
+      cinematicBtn.style.cursor = 'pointer';
+      cinematicBtn.style.fontFamily = 'Orbitron, sans-serif';
+      cinematicBtn.style.borderRadius = '3px';
+      cinematicBtn.style.marginLeft = '6px';
+      cinematicBtn.addEventListener('click', async () => {
+        state.cinematicEnabled = !state.cinematicEnabled;
+        if (state.cinematicEnabled) {
+          // Add only space background; keep normal mode otherwise
+          enableCinematicSpaceBackground();
+          cinematicBtn.textContent = 'Cinematic Mode (On)';
+        } else {
+          disableCinematicSpaceBackground();
+          cinematicBtn.textContent = 'Cinematic Mode';
+        }
+      });
+      menu.appendChild(cinematicBtn);
+    }
+
+    // Purge any stray objects that could dim the scene, then add debug controls
+    try { purgeSceneToEssentials(); } catch {}
 
     return true;
   } catch (error) {
@@ -613,11 +1174,39 @@ const initThreeJS = (container) => {
 
 const toggleDayNight = () => {
   state.isDayMode = !state.isDayMode;
+  
   if (state.globe) {
-    state.globe.material.map = state.isDayMode ? state.dayTexture : state.nightTexture;
+    if (state.isDayMode) {
+      // Day mode: use day texture without bump
+      const dayTex = state.earthTextures?.day || state.dayTexture;
+      state.globe.material.map = dayTex;
+      state.globe.material.bumpMap = null;
     state.globe.material.needsUpdate = true;
-    console.log('Toggled day/night mode:', state.isDayMode);
+      console.log('Switched to DAY mode (no bump map)');
+    } else {
+      // Night mode: use bump relief instead of night texture
+      const bumpTex = state.earthTextures?.bump;
+      if (bumpTex) {
+        state.globe.material.map = bumpTex;
+        state.globe.material.bumpMap = bumpTex;
+        state.globe.material.bumpScale = 0.1; // Increase bump scale for better relief
+        state.globe.material.needsUpdate = true;
+        console.log('Switched to NIGHT mode (using bump relief)');
+      } else {
+        // Fallback to night texture if bump not available
+        const nightTex = state.earthTextures?.night || state.nightTexture;
+        state.globe.material.map = nightTex;
+        state.globe.material.needsUpdate = true;
+        console.log('Switched to NIGHT mode (using night texture as fallback)');
+      }
+    }
+    
+    // Ensure country boundaries stay attached after texture change
+    if (typeof reattachCountryBoundaries === 'function') {
+      reattachCountryBoundaries();
+    }
   }
+  console.log('Toggled day/night mode:', state.isDayMode);
 };
 
 const createProceduralStarfield = () => {
@@ -680,30 +1269,35 @@ const createProceduralStarfield = () => {
   console.log('Enhanced procedural starfield created with', starCount, 'colorful stars');
   return false;
 };
-
 const createGlobe = () => {
   console.log('Creating globe...');
   const geometry = new THREE.SphereGeometry(CONFIG.radius, 128, 128);
-  const material = new THREE.MeshStandardMaterial({
-    roughness: 0.8,  // Higher roughness for more natural, matte appearance
-    metalness: 0.0,  // No metalness for natural Earth look
+  const material = new THREE.MeshBasicMaterial({
     transparent: false,
     opacity: 1.0,
     side: THREE.FrontSide,
     depthTest: true,
     depthWrite: true,
-    flatShading: false // Smooth shading for clarity
+    toneMapped: false
   });
 
   state.globe = new THREE.Mesh(geometry, material);
   if (!state.globe) throw new Error('Globe mesh creation failed');
+  // Ensure clean, colored base (no relief/normal maps, no tint)
+  state.globe.material.map = null;
+  state.globe.material.bumpMap = null;
+  state.globe.material.normalMap = null;
+  if (state.globe.material.color) state.globe.material.color.set(0xffffff);
   state.globe.rotation.y = Math.PI;
   state.scene.add(state.globe);
   console.log('Globe added to scene:', state.globe);
 
-  // No atmosphere - clean Earth appearance
-
-  // Atmosphere removed for cleaner look
+  // Ensure globe has no children (no clouds/atmosphere/country lines)
+  try {
+    const remove = [];
+    (state.globe.children || []).forEach(ch => remove.push(ch));
+    remove.forEach(ch => state.globe.remove(ch));
+  } catch {}
 
   state.arcGroup = new THREE.Group();
   state.arcGroup.renderOrder = 10;
@@ -716,47 +1310,78 @@ const createGlobe = () => {
 
 
   const loader = new THREE.TextureLoader();
-  console.log('Loading day texture from:', './8k_earth_daymap.jpg');
-  state.dayTexture = loader.load(
-    './8k_earth_daymap.jpg',
-    (tex) => {
-      console.log('✔ Day texture loaded successfully');
-      if (state.isDayMode) {
+  // Helpers to apply common texture settings
+  function prepareTexture(tex) {
+      try {
+        if ('colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace; else if ('encoding' in tex) tex.encoding = THREE.sRGBEncoding;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+        if (state.renderer && state.renderer.capabilities && state.renderer.capabilities.getMaxAnisotropy) {
+          tex.anisotropy = state.renderer.capabilities.getMaxAnisotropy();
+        }
+    } catch (e) { console.warn('Texture setup failed:', e); }
+    return tex;
+  }
+
+  // Load multiple base maps (day/night high-res and alt night)
+  // Default to the requested base image: diffuse.jpg
+  const baseTex = prepareTexture(loader.load('./diffuse.jpg', (tex) => {
         material.map = tex;
         material.needsUpdate = true;
-      }
-    },
-    (xhr) => console.log(`Day texture loading: ${(xhr.loaded / xhr.total * 100)}%`),
-    (err) => {
-      console.warn('Day texture failed to load from ./8k_earth_daymap.jpg:', err);
-      if (state.globe) state.globe.material.color.set(0x0000ff);
-    }
-  );
-  console.log('Loading night texture from:', './8k_earth_nightmap.jpg');
-  state.nightTexture = loader.load(
-    './8k_earth_nightmap.jpg',
-    (tex) => {
-      console.log('✔ Night texture loaded successfully');
-      if (!state.isDayMode) {
-        material.map = tex;
-        material.needsUpdate = true;
-      }
-    },
-    (xhr) => console.log(`Night texture loading: ${(xhr.loaded / xhr.total * 100)}%`),
-    (err) => console.warn('Night texture failed to load from ./8k_earth_nightmap.jpg', err)
-  );
+  }));
+  state.dayTexture = baseTex;
+  state.nightTexture = baseTex;
 
   state.earthTextures = {};
-  // Set day texture as default for clearer appearance
-  state.earthTextures.day = loader.load('./8081_earthmap10k.jpg', (tex) => {
-    if (state.globe) {
+  // Use the same diffuse as day map by default
+  state.earthTextures.day = baseTex;
+  state.earthTextures.night = prepareTexture(loader.load('./abovetheclouds-master/textures/desktop/earth/night.jpg', undefined, undefined, () => {
+    state.earthTextures.night = prepareTexture(loader.load('./8k_earth_nightmap.jpg'));
+  }));
+  state.earthTextures.nightAlt = prepareTexture(loader.load('./earthnight.jpg'));
+  state.earthTextures.dnb = prepareTexture(loader.load('./dnb_land_ocean_ice.2012.3600x1800.jpg'));
+  
+  state.earthTextures.bump = prepareTexture(loader.load('./abovetheclouds-master/textures/desktop/earth/bump.jpg', undefined, undefined, () => {
+    state.earthTextures.bump = prepareTexture(loader.load('./8081_earthbump10k.jpg'));
+  }));
+
+  // Utility to set globe map (keeps current material type)
+  function setGlobeMap(tex) {
+    if (!state.globe) return;
       state.globe.material.map = tex;
       state.globe.material.needsUpdate = true;
-      console.log('✔ Day texture set as default for clear earth view');
+  }
+
+  // Relief toggle: switch between Basic (no relief) and Phong (with bump)
+  let reliefEnabled = false;
+  function setRelief(enabled) {
+    reliefEnabled = !!enabled;
+    if (!state.globe) return;
+    const currentMap = state.globe.material.map;
+    if (reliefEnabled) {
+      const phong = new THREE.MeshPhongMaterial({
+        map: currentMap || state.earthTextures.day,
+        bumpMap: state.earthTextures.bump || null,
+        bumpScale: 0.03,
+                shininess: 0,
+        side: THREE.FrontSide
+      });
+      state.globe.material.dispose?.();
+      state.globe.material = phong;
+    } else {
+      const basic = new THREE.MeshBasicMaterial({
+        map: currentMap || state.earthTextures.day,
+        side: THREE.FrontSide,
+        toneMapped: false
+      });
+      state.globe.material.dispose?.();
+      state.globe.material = basic;
     }
-  });
-  state.earthTextures.night = loader.load('./8081_earthlights10k.jpg');
-  state.earthTextures.bump = loader.load('./8081_earthbump10k.jpg');
+      state.globe.material.needsUpdate = true;
+    }
 
   function addEarthTextureButtons() {
     const menu = document.getElementById('menu');
@@ -769,7 +1394,8 @@ const createGlobe = () => {
     [
       { id: 'btn-earth-day', label: 'Day', key: 'day' },
       { id: 'btn-earth-night', label: 'Night', key: 'night' },
-      { id: 'btn-earth-bump', label: 'Relief', key: 'bump' }
+      { id: 'btn-earth-night-alt', label: 'Night Alt', key: 'nightAlt' },
+      { id: 'btn-earth-dnb', label: 'NASA DNB', key: 'dnb' }
     ].forEach(({id, label, key}) => {
       const btn = document.createElement('button');
       btn.id = id;
@@ -785,12 +1411,72 @@ const createGlobe = () => {
       btn.addEventListener('click', () => {
         if (state.globe && state.earthTextures[key]) {
           state.globe.material.map = state.earthTextures[key];
+          state.globe.material.bumpMap = null;
+          state.globe.material.normalMap = null;
           state.globe.material.needsUpdate = true;
+          // Ensure country boundaries stay attached after texture change
+          if (typeof reattachCountryBoundaries === 'function') {
+            reattachCountryBoundaries();
+          }
         }
       });
       container.appendChild(btn);
     });
     menu.appendChild(container);
+
+    // Lights toggle button
+    const lightBtn = document.createElement('button');
+    lightBtn.id = 'btn-light-toggle';
+    lightBtn.textContent = 'Lights: Off';
+    lightBtn.style.background = 'rgba(255,255,255,0.2)';
+    lightBtn.style.color = 'white';
+    lightBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+    lightBtn.style.padding = '5px 10px';
+    lightBtn.style.cursor = 'pointer';
+    lightBtn.style.fontFamily = 'Orbitron, sans-serif';
+    lightBtn.style.borderRadius = '3px';
+    lightBtn.style.marginLeft = '6px';
+    lightBtn.addEventListener('click', () => {
+      const next = !state.litMode;
+      setLitMode(next);
+      lightBtn.textContent = next ? 'Lights: On' : 'Lights: Off';
+    });
+    menu.appendChild(lightBtn);
+
+    // ATC Earth removed per simplification
+
+    // Simple Lights button (user preset)
+    const simpleBtn = document.createElement('button');
+    simpleBtn.id = 'btn-simple-lights';
+    simpleBtn.textContent = 'Simple Lights';
+    simpleBtn.style.background = 'rgba(255,255,255,0.2)';
+    simpleBtn.style.color = 'white';
+    simpleBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+    simpleBtn.style.padding = '5px 10px';
+    simpleBtn.style.cursor = 'pointer';
+    simpleBtn.style.fontFamily = 'Orbitron, sans-serif';
+    simpleBtn.style.borderRadius = '3px';
+    simpleBtn.style.marginLeft = '6px';
+    simpleBtn.addEventListener('click', () => {
+      applySimpleLights();
+      setLitMode(true);
+    });
+    menu.appendChild(simpleBtn);
+
+    // Simple Mode button
+    const smBtn = document.createElement('button');
+    smBtn.id = 'btn-simple-mode';
+    smBtn.textContent = 'Simple Mode';
+    smBtn.style.background = 'rgba(255,255,255,0.2)';
+    smBtn.style.color = 'white';
+    smBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+    smBtn.style.padding = '5px 10px';
+    smBtn.style.cursor = 'pointer';
+    smBtn.style.fontFamily = 'Orbitron, sans-serif';
+    smBtn.style.borderRadius = '3px';
+    smBtn.style.marginLeft = '6px';
+    smBtn.addEventListener('click', toggleSimpleMode);
+    menu.appendChild(smBtn);
   }
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     addEarthTextureButtons();
@@ -798,77 +1484,537 @@ const createGlobe = () => {
     window.addEventListener('DOMContentLoaded', addEarthTextureButtons);
   }
 
-  createProceduralStarfield(); // Enable starfield background
+  // Lightweight TTS controls UI (API key + enable audio)
+  try {
+    const menu = document.getElementById('menu');
+    if (menu && !document.getElementById('tts-controls')) {
+      const ttsDiv = document.createElement('div');
+      ttsDiv.id = 'tts-controls';
+      ttsDiv.style.display = 'inline-flex';
+      ttsDiv.style.alignItems = 'center';
+      ttsDiv.style.gap = '6px';
+      ttsDiv.style.marginLeft = '10px';
 
-  fetch('./submarine_cables.geojson')
-    .then(res => res.json())
-    .then(data => {
-      data.features.forEach(feature => {
-        if (feature.geometry.type === 'LineString') {
-          const points = feature.geometry.coordinates.map(coord => latLongToVector3(coord[1], coord[0], CONFIG.radius * 1.01));
-          const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
-          const lineMat = new THREE.LineBasicMaterial({ color: 0x888888, opacity: 0.3, transparent: true });
-          const line = new THREE.Line(lineGeom, lineMat);
-          state.globe.add(line);
-        } else if (feature.geometry.type === 'MultiLineString') {
-          feature.geometry.coordinates.forEach(lineCoords => {
-            const points = lineCoords.map(coord => latLongToVector3(coord[1], coord[0], CONFIG.radius * 1.01));
-            const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
-            const lineMat = new THREE.LineBasicMaterial({ color: 0x888888, opacity: 0.3, transparent: true });
-            const line = new THREE.Line(lineGeom, lineMat);
-            state.globe.add(line);
-          });
+      // Provider select
+      const providerSelect = document.createElement('select');
+      providerSelect.id = 'tts-provider';
+      providerSelect.style.background = 'rgba(255,255,255,0.1)';
+      providerSelect.style.color = 'white';
+      providerSelect.style.border = '1px solid rgba(255,255,255,0.5)';
+      providerSelect.style.padding = '4px 6px';
+      providerSelect.style.fontFamily = 'Orbitron, sans-serif';
+      ;['eleven','openai'].forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v === 'eleven' ? 'ElevenLabs' : 'OpenAI';
+        providerSelect.appendChild(opt);
+      });
+      providerSelect.value = (localStorage.getItem('TTS_PROVIDER') || 'openai');
+      providerSelect.addEventListener('change', () => {
+        localStorage.setItem('TTS_PROVIDER', providerSelect.value);
+      });
+
+      // ElevenLabs voice id
+      const voiceInput = document.createElement('input');
+      voiceInput.type = 'text';
+      voiceInput.placeholder = 'ElevenLabs Voice ID';
+      voiceInput.value = localStorage.getItem('ELEVEN_VOICE_ID') || 'yf18OYKcMjTlVAGNuq5t';
+      voiceInput.style.width = '170px';
+      voiceInput.style.background = 'rgba(255,255,255,0.1)';
+      voiceInput.style.color = 'white';
+      voiceInput.style.border = '1px solid rgba(255,255,255,0.5)';
+      voiceInput.style.padding = '4px 6px';
+      voiceInput.style.fontFamily = 'Orbitron, sans-serif';
+      voiceInput.addEventListener('change', () => {
+        localStorage.setItem('ELEVEN_VOICE_ID', voiceInput.value.trim());
+      });
+
+      // ElevenLabs API key (dev only; sent via header to server proxy)
+      const elevenKeyInput = document.createElement('input');
+      elevenKeyInput.type = 'password';
+      elevenKeyInput.placeholder = 'ElevenLabs API Key (dev)';
+      elevenKeyInput.value = (localStorage.getItem('ELEVENLABS_API_KEY') || '').replace(/.(?=.{4})/g, '*');
+      elevenKeyInput.style.width = '180px';
+      elevenKeyInput.style.background = 'rgba(255,255,255,0.1)';
+      elevenKeyInput.style.color = 'white';
+      elevenKeyInput.style.border = '1px solid rgba(255,255,255,0.5)';
+      elevenKeyInput.style.padding = '4px 6px';
+      elevenKeyInput.style.fontFamily = 'Orbitron, sans-serif';
+      elevenKeyInput.autocomplete = 'off';
+      const elevenShowBtn = document.createElement('button');
+      elevenShowBtn.textContent = 'Show';
+      elevenShowBtn.style.background = 'rgba(255,255,255,0.2)';
+      elevenShowBtn.style.color = 'white';
+      elevenShowBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+      elevenShowBtn.style.padding = '4px 8px';
+      elevenShowBtn.style.cursor = 'pointer';
+      elevenShowBtn.style.fontFamily = 'Orbitron, sans-serif';
+      elevenShowBtn.addEventListener('click', () => {
+        if (elevenKeyInput.type === 'password') {
+          elevenKeyInput.type = 'text';
+          elevenKeyInput.value = localStorage.getItem('ELEVENLABS_API_KEY') || '';
+          elevenShowBtn.textContent = 'Hide';
+        } else {
+          elevenKeyInput.type = 'password';
+          elevenKeyInput.value = (localStorage.getItem('ELEVENLABS_API_KEY') || '').replace(/.(?=.{4})/g, '*');
+          elevenShowBtn.textContent = 'Show';
         }
       });
-      console.log('Local submarine cables loaded');
-    })
-    .catch(err => console.warn('Failed to load submarine_cables.geojson:', err));
+      const elevenSaveBtn = document.createElement('button');
+      elevenSaveBtn.textContent = 'Save 11Labs Key';
+      elevenSaveBtn.style.background = 'rgba(0,229,255,0.25)';
+      elevenSaveBtn.style.color = 'white';
+      elevenSaveBtn.style.border = '1px solid rgba(0,229,255,0.7)';
+      elevenSaveBtn.style.padding = '4px 8px';
+      elevenSaveBtn.style.cursor = 'pointer';
+      elevenSaveBtn.style.fontFamily = 'Orbitron, sans-serif';
+      elevenSaveBtn.addEventListener('click', () => {
+        const raw = elevenKeyInput.type === 'text' ? elevenKeyInput.value : (localStorage.getItem('ELEVENLABS_API_KEY') || '');
+        if (!raw) { alert('Enter a valid ElevenLabs key'); return; }
+        try { localStorage.setItem('ELEVENLABS_API_KEY', raw); } catch (e) {}
+        elevenKeyInput.type = 'password';
+        elevenKeyInput.value = (raw || '').replace(/.(?=.{4})/g, '*');
+        console.log('✅ ElevenLabs key saved to localStorage (dev)');
+      });
 
-  fetch('./worldCountries.geojson')
-    .then(res => res.json())
-    .then(data => {
-      let processedCount = 0;
-      data.features.forEach(feature => {
-        const countryCode = feature.properties.ISO || feature.properties.iso_a2 || feature.properties.ISO_A2 || feature.properties.ISO_A3;
-        if (!countryCode) {
-          console.warn('Skipping feature without valid country code:', feature.properties);
+      const keyInput = document.createElement('input');
+      keyInput.type = 'password';
+      keyInput.placeholder = 'OpenAI API Key';
+      keyInput.value = (window.OPENAI_API_KEY || '').replace(/.(?=.{4})/g, '*');
+      keyInput.style.width = '180px';
+      keyInput.style.background = 'rgba(255,255,255,0.1)';
+      keyInput.style.color = 'white';
+      keyInput.style.border = '1px solid rgba(255,255,255,0.5)';
+      keyInput.style.padding = '4px 6px';
+      keyInput.style.fontFamily = 'Orbitron, sans-serif';
+      keyInput.autocomplete = 'off';
+
+      const showBtn = document.createElement('button');
+      showBtn.textContent = 'Show';
+      showBtn.style.background = 'rgba(255,255,255,0.2)';
+      showBtn.style.color = 'white';
+      showBtn.style.border = '1px solid rgba(255,255,255,0.5)';
+      showBtn.style.padding = '4px 8px';
+      showBtn.style.cursor = 'pointer';
+      showBtn.style.fontFamily = 'Orbitron, sans-serif';
+      showBtn.addEventListener('click', () => {
+        if (keyInput.type === 'password') {
+          keyInput.type = 'text';
+          keyInput.value = window.OPENAI_API_KEY || '';
+          showBtn.textContent = 'Hide';
+        } else {
+          keyInput.type = 'password';
+          keyInput.value = (window.OPENAI_API_KEY || '').replace(/.(?=.{4})/g, '*');
+          showBtn.textContent = 'Show';
+        }
+      });
+
+      const saveBtn = document.createElement('button');
+      saveBtn.textContent = 'Save Key';
+      saveBtn.style.background = 'rgba(0,229,255,0.25)';
+      saveBtn.style.color = 'white';
+      saveBtn.style.border = '1px solid rgba(0,229,255,0.7)';
+      saveBtn.style.padding = '4px 8px';
+      saveBtn.style.cursor = 'pointer';
+      saveBtn.style.fontFamily = 'Orbitron, sans-serif';
+      saveBtn.addEventListener('click', () => {
+        const raw = keyInput.type === 'text' ? keyInput.value : window.OPENAI_API_KEY || '';
+        if (!raw || !raw.startsWith('sk-')) {
+          alert('Please enter a valid OpenAI API key (starts with sk-)');
           return;
         }
-        if (!state.countryLines[countryCode]) state.countryLines[countryCode] = [];
-        const geometryType = feature.geometry.type;
-        let polygons = [];
-        if (geometryType === 'Polygon') {
-          polygons = [feature.geometry.coordinates];
-        } else if (geometryType === 'MultiPolygon') {
-          polygons = feature.geometry.coordinates;
-        }
-        polygons.forEach(polygon => {
-          polygon.forEach(ring => {
-            // Store original lat/lon coordinates for reprojection
-            const originalCoords = ring.map(coord => [coord[1], coord[0]]); // [lat, lon]
-
-            // Create country lines at initial projection
-            const points = originalCoords.map(coord => latLongToVector3(coord[0], coord[1], CONFIG.radius * 1.001));
-            const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
-            const lineMat = new THREE.LineBasicMaterial({ color: 0xadd8e6, opacity: 0.5, transparent: true });
-            const line = new THREE.Line(lineGeom, lineMat);
-
-            // Store original coordinates on the line for reprojection
-            line.userData.originalCoords = originalCoords;
-
-            state.countryGroup.add(line);
-            state.countryLines[countryCode].push(line);
-
-            processedCount++;
-          });
-        });
+        window.OPENAI_API_KEY = raw;
+        try { localStorage.setItem('OPENAI_API_KEY', raw); } catch (e) {}
+        keyInput.type = 'password';
+        keyInput.value = (raw || '').replace(/.(?=.{4})/g, '*');
+        console.log('✅ OpenAI key saved to localStorage');
       });
-      console.log('Local world countries loaded - Processed lines:', processedCount);
-    })
-    .catch(err => console.warn('Failed to load worldCountries.geojson:', err));
+
+      // Language selector and translate toggle
+      const langSelect = document.createElement('select');
+      langSelect.id = 'tts-lang';
+      langSelect.style.background = 'rgba(255,255,255,0.1)';
+      langSelect.style.color = 'white';
+      langSelect.style.border = '1px solid rgba(255,255,255,0.5)';
+      langSelect.style.padding = '4px 6px';
+      langSelect.style.fontFamily = 'Orbitron, sans-serif';
+      const langs = [
+        { v: 'en', n: 'English' },
+        { v: 'es', n: 'Spanish' },
+        { v: 'fr', n: 'French' },
+        { v: 'de', n: 'German' },
+        { v: 'pt', n: 'Portuguese' },
+        { v: 'ja', n: 'Japanese' },
+        { v: 'zh', n: 'Chinese' },
+        { v: 'it', n: 'Italian' },
+        { v: 'ms', n: 'Malay' }
+      ];
+      langs.forEach(({v,n}) => { const o=document.createElement('option'); o.value=v; o.textContent=n; langSelect.appendChild(o); });
+      langSelect.value = localStorage.getItem('TTS_LANG') || 'en';
+      langSelect.addEventListener('change', () => {
+        localStorage.setItem('TTS_LANG', langSelect.value);
+        // Auto-enable translation when choosing a non-English language
+        const isNonEnglish = langSelect.value && langSelect.value !== 'en';
+        const translateToggleEl = document.getElementById('tts-translate');
+        if (isNonEnglish) {
+          try {
+            localStorage.setItem('TTS_TRANSLATE', 'true');
+            if (translateToggleEl) translateToggleEl.checked = true;
+          } catch {}
+        }
+      });
+
+      const translateToggle = document.createElement('input');
+      translateToggle.type = 'checkbox';
+      translateToggle.id = 'tts-translate';
+      translateToggle.checked = (localStorage.getItem('TTS_TRANSLATE') === 'true');
+      translateToggle.addEventListener('change', () => {
+        localStorage.setItem('TTS_TRANSLATE', String(translateToggle.checked));
+      });
+
+      const enableBtn = document.createElement('button');
+      enableBtn.textContent = 'Enable Audio';
+      enableBtn.style.background = 'rgba(40,167,69,0.3)';
+      enableBtn.style.color = 'white';
+      enableBtn.style.border = '1px solid rgba(40,167,69,0.7)';
+      enableBtn.style.padding = '4px 8px';
+      enableBtn.style.cursor = 'pointer';
+      enableBtn.style.fontFamily = 'Orbitron, sans-serif';
+      enableBtn.addEventListener('click', async () => {
+        try {
+          // Required user gesture to unlock audio
+          if (audioContext && audioContext.state === 'suspended') {
+            await audioContext.resume();
+          }
+          if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          await new Audio().play().catch(() => {});
+          console.log('🔓 Audio unlocked');
+          // Optional: run a short test if key available
+          const provider = localStorage.getItem('TTS_PROVIDER') || 'openai';
+          const targetLang = localStorage.getItem('TTS_LANG') || 'en';
+          const say = (targetLang !== 'en' && (localStorage.getItem('TTS_TRANSLATE') === 'true'))
+            ? 'Audio enabled. Translation is active.'
+            : 'Audio enabled.';
+          speakQueued(say);
+        } catch (e) {
+          console.warn('Failed to unlock audio:', e);
+        }
+      });
+
+      ttsDiv.appendChild(providerSelect);
+      ttsDiv.appendChild(voiceInput);
+      ttsDiv.appendChild(keyInput);
+      ttsDiv.appendChild(showBtn);
+      ttsDiv.appendChild(saveBtn);
+      ttsDiv.appendChild(elevenKeyInput);
+      ttsDiv.appendChild(elevenShowBtn);
+      ttsDiv.appendChild(elevenSaveBtn);
+      ttsDiv.appendChild(langSelect);
+      const translateLabel = document.createElement('label');
+      translateLabel.textContent = 'Translate';
+      translateLabel.style.fontFamily = 'Orbitron, sans-serif';
+      translateLabel.style.fontSize = '12px';
+      translateLabel.style.color = '#add8e6';
+      ttsDiv.appendChild(translateLabel);
+      ttsDiv.appendChild(translateToggle);
+      ttsDiv.appendChild(enableBtn);
+      menu.appendChild(ttsDiv);
+    }
+  } catch (e) {
+    console.warn('TTS controls setup failed:', e);
+  }
+
+  // Extras removed for a clean globe (no cables/country lines)
   state.isGlobeReady = true;
   console.log('Globe creation completed, isGlobeReady:', state.isGlobeReady);
 };
+
+// Enable simple cinematic cloud layer that rotates slowly around the globe
+function enableCinematicClouds() {
+  try {
+    if (!state.globe || state.cloudMesh) return;
+    const loader = new THREE.TextureLoader();
+    const tex = loader.load('./abovetheclouds-master/textures/desktop/earth/clouds.png');
+    if ('colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace; else if ('encoding' in tex) tex.encoding = THREE.sRGBEncoding;
+    const geometry = new THREE.SphereGeometry(CONFIG.radius * 1.015, 128, 128);
+    const material = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.12, depthWrite: false, toneMapped: false });
+    const clouds = new THREE.Mesh(geometry, material);
+    clouds.userData.layer = 'clouds';
+    // Render clouds before arcs so they never overlay latency lines
+    clouds.renderOrder = -20;
+    state.globe.add(clouds);
+    state.cloudMesh = clouds;
+  } catch (e) { console.warn('enableCinematicClouds failed', e); }
+}
+
+function disableCinematicClouds() {
+  try {
+    if (state.cloudMesh && state.globe) {
+      state.globe.remove(state.cloudMesh);
+      state.cloudMesh.geometry.dispose?.();
+      state.cloudMesh.material.dispose?.();
+      state.cloudMesh = null;
+    }
+  } catch (e) { console.warn('disableCinematicClouds failed', e); }
+}
+
+// Load submarine cables slightly above globe surface in faint beige
+async function loadSubmarineCables() {
+  try {
+    if (!state.globe) return;
+    if (!state.cablesGroup) {
+      state.cablesGroup = new THREE.Group();
+      state.cablesGroup.userData.layer = 'cables';
+      state.globe.add(state.cablesGroup);
+    }
+    if (state.cablesGroup.children.length > 0) return; // already loaded
+
+    const res = await fetch('./submarine_cables.geojson');
+    const data = await res.json();
+    const beige = 0xEED9C4; // light faint beige
+    // Densify a linestring into great-circle surface points so it hugs the globe
+    const makeSurfacePoints = (coords, radius) => {
+      const out = [];
+      const r = radius;
+      const stepDeg = 2; // ~2 degrees between samples
+      for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i];
+        const b = coords[i + 1];
+        // Convert to 3D unit vectors
+        const va = latLongToVector3(a[1], a[0], 1).normalize();
+        const vb = latLongToVector3(b[1], b[0], 1).normalize();
+        // Angle between and segment count
+        const dot = Math.max(-1, Math.min(1, va.dot(vb)));
+        const angle = Math.acos(dot); // radians
+        const segments = Math.max(8, Math.ceil((angle * 180 / Math.PI) / stepDeg));
+        for (let s = 0; s <= segments; s++) {
+          const t = s / segments;
+          // Spherical linear interpolation
+          const sinTot = Math.sin(angle) || 1e-6;
+          const w1 = Math.sin((1 - t) * angle) / sinTot;
+          const w2 = Math.sin(t * angle) / sinTot;
+          const vx = new THREE.Vector3(
+            va.x * w1 + vb.x * w2,
+            va.y * w1 + vb.y * w2,
+            va.z * w1 + vb.z * w2
+          ).normalize().multiplyScalar(r);
+          // Avoid duplicate point at joint
+          if (out.length === 0 || !out[out.length - 1].equals(vx)) out.push(vx);
+        }
+      }
+      return out;
+    };
+
+    const makeLine = (coords) => {
+      // Slightly above surface to avoid z-fighting and ensure not inside globe
+      const radius = CONFIG.radius * 1.012;
+      const points = makeSurfacePoints(coords, radius);
+          const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
+      const lineMat = new THREE.LineBasicMaterial({ color: beige, opacity: 0.1, transparent: true, depthWrite: false, depthTest: true });
+          const line = new THREE.Line(lineGeom, lineMat);
+      line.renderOrder = -15; // below arcs
+      state.cablesGroup.add(line);
+    };
+    data.features.forEach(feature => {
+      if (feature.geometry.type === 'LineString') {
+        makeLine(feature.geometry.coordinates);
+        } else if (feature.geometry.type === 'MultiLineString') {
+        feature.geometry.coordinates.forEach(lineCoords => makeLine(lineCoords));
+      }
+    });
+    console.log('Submarine cables loaded:', state.cablesGroup.children.length);
+  } catch (e) { console.warn('loadSubmarineCables failed', e); }
+}
+
+// Reattach country boundaries to the globe (called after texture changes)
+function reattachCountryBoundaries() {
+  if (!state.globe) return;
+  
+  Object.values(state.countryLines).forEach(lines => {
+    lines.forEach(line => {
+      // Remove from old parent if exists
+      if (line.parent && line.parent !== state.globe) {
+        line.parent.remove(line);
+      }
+      // Add to globe if not already added
+      if (line.parent !== state.globe) {
+        state.globe.add(line);
+      }
+    });
+  });
+  
+  console.log('✅ Country boundaries reattached to globe');
+}
+
+// Load country boundaries from worldCountries.geojson
+async function loadCountryBoundaries() {
+  try {
+    console.log('📍 Loading country boundaries from worldCountries.geojson...');
+    
+    const res = await fetch('./worldCountries.geojson');
+    if (!res.ok) {
+      console.warn('worldCountries.geojson not found or failed to load');
+      return;
+    }
+    
+    const data = await res.json();
+    // Use exploded radius if that mode is active
+    const radius = state.explodedCountries ? CONFIG.radius * 1.5 : CONFIG.radius * 1.001;
+    
+    // Helper to convert coordinates to Vector3
+    const coordsToVector3 = (coords, r) => {
+      return coords.map(coord => {
+        const [lon, lat] = coord;
+        return latLongToVector3(lat, lon, r);
+      });
+    };
+    
+    // Process each country feature
+    data.features.forEach(feature => {
+      const countryCode = feature.properties?.ISO_A2 || feature.properties?.iso_a2 || 
+                          feature.properties?.ISO || feature.properties?.id || 'Unknown';
+      const countryName = feature.properties?.NAME || feature.properties?.name || countryCode;
+      
+      if (!state.countryLines[countryCode]) {
+        state.countryLines[countryCode] = [];
+      }
+      
+      const createLine = (coordinates) => {
+        const points = coordsToVector3(coordinates, radius);
+        if (points.length < 2) return;
+        
+        const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
+        const lineMat = new THREE.LineBasicMaterial({ 
+          color: 0xadd8e6, // Light blue
+          opacity: 0.3, 
+          transparent: true,
+          depthWrite: false,
+          depthTest: true
+        });
+        
+        const line = new THREE.Line(lineGeom, lineMat);
+        line.renderOrder = -10; // Below arcs but above most things
+        line.visible = state.showCountries; // Respect initial visibility state
+        
+        // Store original coordinates for reprojection (exploded view)
+        line.userData.originalCoords = coordinates;
+        line.userData.countryCode = countryCode;
+        line.userData.countryName = countryName;
+        
+        state.countryLines[countryCode].push(line);
+        state.globe.add(line); // Add to globe so it rotates with it
+      };
+      
+      // Handle different geometry types
+      if (feature.geometry.type === 'Polygon') {
+        feature.geometry.coordinates.forEach(ring => createLine(ring));
+      } else if (feature.geometry.type === 'MultiPolygon') {
+        feature.geometry.coordinates.forEach(polygon => {
+          polygon.forEach(ring => createLine(ring));
+        });
+      } else if (feature.geometry.type === 'LineString') {
+        createLine(feature.geometry.coordinates);
+      } else if (feature.geometry.type === 'MultiLineString') {
+        feature.geometry.coordinates.forEach(lineCoords => createLine(lineCoords));
+      }
+    });
+    
+    const totalLines = Object.values(state.countryLines).reduce((sum, lines) => sum + lines.length, 0);
+    console.log(`✅ Country boundaries loaded: ${Object.keys(state.countryLines).length} countries, ${totalLines} line segments`);
+    
+  } catch (e) { 
+    console.warn('loadCountryBoundaries failed:', e); 
+  }
+}
+
+// Space background (skybox) from AboveTheClouds
+function enableCinematicSpaceBackground() {
+  try {
+    if (!state.scene || state.skyboxMesh) return;
+    const tl = new THREE.TextureLoader();
+    const path = './abovetheclouds-master/textures/desktop/skybox/';
+    const faces = ['posX.jpg','negX.jpg','posY.jpg','negY.jpg','posZ.jpg','negZ.jpg'];
+    const mats = faces.map(f => {
+      const tex = tl.load(path + f);
+      if ('colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace; else if ('encoding' in tex) tex.encoding = THREE.sRGBEncoding;
+      return new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, toneMapped: false });
+    });
+    const skyGeo = new THREE.BoxGeometry(2000, 2000, 2000);
+    const skybox = new THREE.Mesh(skyGeo, mats);
+    skybox.frustumCulled = false;
+    skybox.renderOrder = -100;
+    state.scene.add(skybox);
+    state.skyboxMesh = skybox;
+  } catch (e) { console.warn('enableCinematicSpaceBackground failed', e); }
+}
+
+function disableCinematicSpaceBackground() {
+  try {
+    if (state.skyboxMesh && state.scene) {
+      state.scene.remove(state.skyboxMesh);
+      if (Array.isArray(state.skyboxMesh.material)) state.skyboxMesh.material.forEach(m => m.dispose?.());
+      state.skyboxMesh.geometry?.dispose?.();
+      state.skyboxMesh = null;
+    }
+  } catch (e) { console.warn('disableCinematicSpaceBackground failed', e); }
+}
+
+// Simple rotating starfield (points) background
+function enableRotatingStarfield() {
+  try {
+    if (!state.scene || state.starfield) return;
+    const starCount = 5000;
+    const geom = new THREE.BufferGeometry();
+    const positions = new Float32Array(starCount * 3);
+    for (let i = 0; i < starCount; i++) {
+      const r = CONFIG.starfieldRadius || 1000;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      positions[i * 3 + 1] = r * Math.cos(phi);
+      positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+    }
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    // Ensure starfield never shows through the opaque globe
+    const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 1, sizeAttenuation: false, depthWrite: false, depthTest: true });
+    const stars = new THREE.Points(geom, mat);
+    stars.userData.layer = 'starfield';
+    stars.renderOrder = -1000;
+    state.scene.add(stars);
+    state.starfield = stars;
+  } catch (e) { console.warn('enableRotatingStarfield failed', e); }
+}
+
+function disableRotatingStarfield() {
+  try {
+    if (state.starfield && state.scene) {
+      state.scene.remove(state.starfield);
+      state.starfield.geometry.dispose?.();
+      state.starfield.material.dispose?.();
+      state.starfield = null;
+    }
+  } catch (e) { console.warn('disableRotatingStarfield failed', e); }
+}
+
+// Hard purge: keep only the globe and its managed groups to avoid stray dimming layers
+function purgeSceneToEssentials() {
+  if (!state.scene) return;
+  const essentials = new Set();
+  if (state.globe) essentials.add(state.globe);
+  if (state.arcGroup) essentials.add(state.arcGroup);
+  if (state.countryGroup) essentials.add(state.countryGroup);
+  if (state.logoSprite) essentials.add(state.logoSprite);
+  if (state.cloudMesh) essentials.add(state.cloudMesh);
+  if (state.cablesGroup) essentials.add(state.cablesGroup);
+  if (state.lights) {
+    Object.values(state.lights).forEach(l => l && essentials.add(l));
+  }
+  const toRemove = [];
+  state.scene.children.forEach(obj => { if (!essentials.has(obj)) toRemove.push(obj); });
+  toRemove.forEach(obj => state.scene.remove(obj));
+}
 
 const latLongToVector3 = (lat, lon, radius = CONFIG.radius) => {
   const phi = (90 - lat) * (Math.PI / 180);
@@ -879,20 +2025,43 @@ const latLongToVector3 = (lat, lon, radius = CONFIG.radius) => {
     radius * Math.sin(phi) * Math.sin(theta)
   );
 };
-
 const createAnimatedArc = (arcData, batchStartTime) => {
   if (!state.isGlobeReady) {
     console.log('Globe not ready, queuing arc:', arcData);
     return;
   }
 
-  if (state.flightArcs.length >= CONFIG.maxActiveArcs) {
-    console.warn('Max arcs reached, skipping new arc');
+  const maxActiveArcs = state.currentMaxActiveArcs || CONFIG.maxActiveArcs;
+  if (state.flightArcs.length >= maxActiveArcs) {
+    console.warn(`Max arcs reached (${maxActiveArcs}), skipping new arc`);
     return;
   }
 
-  const start = latLongToVector3(arcData.source_latitude || arcData.source.lat, arcData.source_longitude || arcData.source.lng);
-  const end = latLongToVector3(arcData.dest_latitude || arcData.destination.lat, arcData.dest_longitude || arcData.destination.lng);
+  // Validate coordinates before creating arc
+  const srcLat = arcData.source_latitude || arcData.source?.lat;
+  const srcLon = arcData.source_longitude || arcData.source?.lng;
+  const destLat = arcData.dest_latitude || arcData.destination?.lat;
+  const destLon = arcData.dest_longitude || arcData.destination?.lng;
+  
+  // Check for invalid coordinates (NaN, undefined, or at 0,0 which is ocean)
+  if (!srcLat || !srcLon || !destLat || !destLon || 
+      isNaN(srcLat) || isNaN(srcLon) || isNaN(destLat) || isNaN(destLon) ||
+      (Math.abs(srcLat) < 0.01 && Math.abs(srcLon) < 0.01) ||
+      (Math.abs(destLat) < 0.01 && Math.abs(destLon) < 0.01)) {
+    console.warn('Skipping arc with invalid coordinates:', { srcLat, srcLon, destLat, destLon });
+    return;
+  }
+
+  const start = latLongToVector3(srcLat, srcLon);
+  const end = latLongToVector3(destLat, destLon);
+  
+  // Additional validation: check if vectors are valid
+  if (isNaN(start.x) || isNaN(start.y) || isNaN(start.z) ||
+      isNaN(end.x) || isNaN(end.y) || isNaN(end.z)) {
+    console.warn('Skipping arc with NaN vector coordinates');
+    return;
+  }
+  
   const latency = parseFloat(arcData.avgTime) || 0;
   const colorHex = getLatencyColor(latency);
   let color;
@@ -904,13 +2073,32 @@ const createAnimatedArc = (arcData, batchStartTime) => {
       : latency <= 300;
     color = new THREE.Color(compliant ? 0x00ff00 : 0xff0000);
   } else {
-    color = new THREE.Color(colorHex);
+    if (state.qualooColorsMode) {
+      const palette = CONFIG.qualooPalette;
+      state.qualooColorIndex = (state.qualooColorIndex + 1) % palette.length;
+      color = new THREE.Color(palette[state.qualooColorIndex]);
+    } else {
+      color = new THREE.Color(colorHex);
+    }
   }
   const isHighlight = latency >= CONFIG.highlightThreshold;
 
-  const randomDelay = Math.random() * 2000;
+  let randomDelay = Math.random() * 2000;
+  // Music sync: bias arc start on detected beats/pulses
+  if (state.musicSyncMode && audioDetectionEnabled && analyser) {
+    const len = analyser.frequencyBinCount;
+    const arr = new Uint8Array(len);
+    analyser.getByteFrequencyData(arr);
+    // Simple beat proxy: high energy in low-mid bands (bins ~5-20)
+    let energy = 0; let count = 0;
+    for (let i = 5; i < Math.min(20, len); i++) { energy += arr[i]; count++; }
+    const avg = count ? energy / count : 0;
+    if (avg > 80) randomDelay = 50; // on-beat: fire quickly
+    else if (avg > 50) randomDelay = 200; // near-beat: slight delay
+  }
   const randomArcDuration = CONFIG.arcDuration + (Math.random() - 0.5) * 2000;
   const randomTraceTime = CONFIG.traceTime + (Math.random() - 0.5) * 2000;
+  // Arc height purely from CONFIG.arcHeightFactor
   const randomHeightFactor = CONFIG.arcHeightFactor * (0.8 + Math.random() * 0.6);
 
   const sN = start.clone().normalize();
@@ -928,22 +2116,27 @@ const createAnimatedArc = (arcData, batchStartTime) => {
     const t = i / segments;
     const quat = new THREE.Quaternion().setFromAxisAngle(axis, angle * t);
     const p = sN.clone().applyQuaternion(quat);
-    const elev = randomHeightFactor * Math.sin(Math.PI * t);
+    // Ensure a visible lift even at low CONFIG.arcHeightFactor (helps with skybox depth perception)
+    const baseLift = (typeof CONFIG.minArcLift === 'number') ? CONFIG.minArcLift : 0.04;
+    const elev = Math.max(baseLift, randomHeightFactor * Math.sin(Math.PI * t));
     p.multiplyScalar(CONFIG.radius * (1 + elev));
     points.push(p);
   }
 
   const curve = new THREE.CatmullRomCurve3(points);
-  const geometry = new THREE.TubeGeometry(curve, segments, 0.006, 8, false);
+  const geometry = new THREE.TubeGeometry(curve, segments, 0.004, 12, false);
 
+  // Use the configured color directly for high visibility
+  const displayColor = color.clone();
   const material = new THREE.MeshBasicMaterial({
-    color: color,
-    transparent: true,
-    opacity: 0.8, // Increased from 0.5 for brighter arcs
+    color: displayColor,
+    transparent: false,
+    opacity: 1.0,
     blending: THREE.NormalBlending,
     depthTest: true,
     depthWrite: false,
-    side: THREE.DoubleSide
+    side: THREE.DoubleSide,
+    toneMapped: false
   });
 
   const tube = new THREE.Mesh(geometry, material);
@@ -956,11 +2149,12 @@ const createAnimatedArc = (arcData, batchStartTime) => {
   const particlePos = new Float32Array([start.x, start.y, start.z]);
   particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePos, 3));
   const particleMat = new THREE.PointsMaterial({
-    color: color,
-    size: isHighlight ? CONFIG.pointSize * 1.5 : CONFIG.pointSize,
+    color: displayColor,
+    size: isHighlight ? CONFIG.pointSize * 1.8 : CONFIG.pointSize * 1.4,
     map: state.circleTexture,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
+    transparent: false,
+    opacity: 1.0,
+    blending: THREE.NormalBlending,
     depthTest: true,
     depthWrite: false,
     sizeAttenuation: false
@@ -973,11 +2167,12 @@ const createAnimatedArc = (arcData, batchStartTime) => {
   const sourcePos = new Float32Array([start.x, start.y, start.z]);
   sourceGeo.setAttribute('position', new THREE.BufferAttribute(sourcePos, 3));
   const sourceMat = new THREE.PointsMaterial({
-    color: color,
-    size: CONFIG.dotSize,
+    color: displayColor,
+    size: CONFIG.dotSize * 1.4,
     map: state.circleTexture,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
+    transparent: false,
+    opacity: 1.0,
+    blending: THREE.NormalBlending,
     depthTest: true,
     depthWrite: false,
     sizeAttenuation: false
@@ -990,11 +2185,12 @@ const createAnimatedArc = (arcData, batchStartTime) => {
   const destPos = new Float32Array([end.x, end.y, end.z]);
   destGeo.setAttribute('position', new THREE.BufferAttribute(destPos, 3));
   const destMat = new THREE.PointsMaterial({
-    color: color,
-    size: CONFIG.dotSize,
+    color: displayColor,
+    size: CONFIG.dotSize * 1.4,
     map: state.circleTexture,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
+    transparent: false,
+    opacity: 1.0,
+    blending: THREE.NormalBlending,
     depthTest: true,
     depthWrite: false,
     sizeAttenuation: false
@@ -1029,15 +2225,7 @@ const createAnimatedArc = (arcData, batchStartTime) => {
     destination: { lat: arcData.destination.lat, lng: arcData.destination.lng }
   };
 
-  if (latency > 400) {
-    const warningGeom = new THREE.SphereGeometry(0.1, 8, 8);
-    const warningMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 1, blending: THREE.AdditiveBlending });
-    const warning = new THREE.Mesh(warningGeom, warningMat);
-    warning.position.copy(start);
-    state.scene.add(warning);
-    const normal = start.clone().normalize();
-    arc.warning = { mesh: warning, velocity: normal.clone().multiplyScalar(0.01), startTime: batchStartTime };
-  }
+  // Removed red warning dots
 
   state.flightArcs.push(arc);
 
@@ -1064,18 +2252,25 @@ const processPendingArcs = () => {
   }
   state.isProcessingBatch = true;
   const batchStartTime = performance.now();
-  const arcsToCreate = Math.min(CONFIG.animationBatchSize, CONFIG.maxActiveArcs - state.flightArcs.length, state.pendingArcs.length);
+  const maxActiveArcs = state.currentMaxActiveArcs || CONFIG.maxActiveArcs;
+  const arcsToCreate = Math.min(CONFIG.animationBatchSize, maxActiveArcs - state.flightArcs.length, state.pendingArcs.length);
   const batch = state.pendingArcs.splice(0, arcsToCreate);
   console.log(`🎬 Processing animation batch: ${arcsToCreate} arcs (${state.pendingArcs.length} remaining, ${state.flightArcs.length} active)`);
   
-  // Process batch more efficiently
+  // Process batch more efficiently with strict validation
   const validArcs = batch.filter(arcData => {
+    const srcLat = parseFloat(arcData.source_latitude);
+    const srcLon = parseFloat(arcData.source_longitude);
+    const destLat = parseFloat(arcData.dest_latitude);
+    const destLon = parseFloat(arcData.dest_longitude);
+    
+    // Check for valid, non-zero coordinates
     return arcData.source_latitude && arcData.source_longitude && 
            arcData.dest_latitude && arcData.dest_longitude &&
-           !isNaN(parseFloat(arcData.source_latitude)) && 
-           !isNaN(parseFloat(arcData.source_longitude)) &&
-           !isNaN(parseFloat(arcData.dest_latitude)) && 
-           !isNaN(parseFloat(arcData.dest_longitude));
+           !isNaN(srcLat) && !isNaN(srcLon) &&
+           !isNaN(destLat) && !isNaN(destLon) &&
+           !(Math.abs(srcLat) < 0.01 && Math.abs(srcLon) < 0.01) &&  // Not 0,0
+           !(Math.abs(destLat) < 0.01 && Math.abs(destLon) < 0.01);  // Not 0,0
   });
   
   console.log(`✅ Batch validation: ${validArcs.length}/${batch.length} arcs are valid`);
@@ -1123,11 +2318,59 @@ const fetchUniqueValues = async (endpoint) => {
   }
 };
 
+const updateFilterDropdownsFromData = (data) => {
+  if (!data || data.length === 0) {
+    console.log('No data to update filter dropdowns');
+    return;
+  }
+  
+  // Extract unique values from the fetched data
+  const sourceCountries = new Set();
+  const destCountries = new Set();
+  const operators = new Set();
+  const sourceRegions = new Set();
+  const destRegions = new Set();
+  
+  data.forEach(item => {
+    if (item.source_country && item.source_country !== 'Unknown') sourceCountries.add(item.source_country);
+    if (item.dest_country && item.dest_country !== 'Unknown') destCountries.add(item.dest_country);
+    if (item.operator && item.operator !== 'Unknown') operators.add(item.operator);
+    if (item.source_region && item.source_region !== 'Unknown') sourceRegions.add(item.source_region);
+    if (item.dest_region && item.dest_region !== 'Unknown') destRegions.add(item.dest_region);
+  });
+  
+  console.log('📊 Updating filter dropdowns from fetched data:', {
+    sourceCountries: sourceCountries.size,
+    destCountries: destCountries.size,
+    operators: operators.size,
+    sourceRegions: sourceRegions.size,
+    destRegions: destRegions.size
+  });
+  
+  // Update dropdowns
+  populateDropdown('source-country', Array.from(sourceCountries).sort(), { convertCountryCodes: true });
+  populateDropdown('dest-country', Array.from(destCountries).sort(), { convertCountryCodes: true });
+  populateDropdown('source-operator', Array.from(operators).sort());
+  populateDropdown('source-region', Array.from(sourceRegions).sort(), { convertCountryCodes: true });
+  populateDropdown('dest-region', Array.from(destRegions).sort(), { convertCountryCodes: true });
+};
+
 const populateDropdown = (id, values, options = {}) => {
   const select = document.getElementById(id);
-  if (select) {
+  if (!select) return;
+  
+  // Common countries to always include
+  const commonCountries = ['SG', 'US', 'GB', 'AU', 'DE', 'FR', 'JP', 'CN', 'IN', 'BR', 'CA', 'NL', 'SE', 'NO', 'DK', 'FI', 'ES', 'IT', 'PL', 'RU', 'KR', 'TW', 'HK', 'ID', 'TH', 'MY', 'VN', 'PH', 'NZ', 'ZA', 'AE', 'SA', 'IL', 'TR', 'MX', 'AR', 'CL', 'CO'];
+  
+  // For country dropdowns, merge common countries with provided values
+  const isCountryDropdown = id.includes('country');
+  const mergedValues = isCountryDropdown 
+    ? [...new Set([...commonCountries, ...values])].sort()
+    : values;
+  
     select.innerHTML = '<option value="">All</option>';
-    values.forEach(value => {
+  
+  mergedValues.forEach(value => {
       const option = document.createElement('option');
       option.value = value; // Keep original value for backend filtering
       
@@ -1140,6 +2383,7 @@ const populateDropdown = (id, values, options = {}) => {
       option.textContent = displayText;
       select.appendChild(option);
     });
+  
     select.style.background = '#fff';
     select.style.color = '#222';
     select.style.border = '1px solid #ccc';
@@ -1148,7 +2392,8 @@ const populateDropdown = (id, values, options = {}) => {
     select.style.padding = '4px 8px';
     select.style.borderRadius = '4px';
     select.style.minWidth = '120px';
-  }
+  
+  console.log(`✅ Populated dropdown ${id} with ${mergedValues.length} options`);
 };
 
 if (!document.getElementById('dropdown-style')) {
@@ -1287,11 +2532,32 @@ function getFilterKey(filters) {
   return JSON.stringify(filters || {});
 }
 
-const fetchAllData = async (filters = {}) => {
+const fetchAllData = async (filters = {}, options = {}) => {
   const filterKey = getFilterKey(filters);
   state.activeFilterKey = filterKey;
-  console.log('🌍 Fetching all latency data for last hour with filters:', filters);
-  console.log('📊 CONFIG.fetchBatchSize:', CONFIG.fetchBatchSize, 'CONFIG.statsDataLimit:', CONFIG.statsDataLimit);
+  
+  // Use higher limits for focused country view (OR queries)
+  const fetchBatchSize = options.increasedLimits ? 2000 : CONFIG.fetchBatchSize;  // 2000 for focused queries
+  const statsDataLimit = options.increasedLimits ? 100000 : CONFIG.statsDataLimit;
+  const maxActiveArcs = options.increasedLimits ? 1000 : CONFIG.maxActiveArcs;
+  
+  // Store the active arc limit in state so arc management can use it
+  state.currentMaxActiveArcs = maxActiveArcs;
+  
+  console.log('🌍 Fetching all latency data with filters:', JSON.stringify(filters, null, 2));
+  console.log('📊 Filter details:', {
+    start_date: filters.start_date || 'NOT SET',
+    end_date: filters.end_date || 'NOT SET',
+    source_country: filters.source_country || 'NOT SET',
+    dest_country: filters.dest_country || 'NOT SET'
+  });
+  console.log('📊 Fetch limits:', {
+    fetchBatchSize,
+    statsDataLimit,
+    maxActiveArcs,
+    increasedLimits: options.increasedLimits || false
+  });
+  
   state.isFetching = true;
   state.pendingArcs = [];
   state.allDataForStats = [];
@@ -1303,14 +2569,14 @@ const fetchAllData = async (filters = {}) => {
     let pageCount = 0;
     let hasMore = true;
 
-    while (hasMore && allData.length < CONFIG.statsDataLimit) {
+    while (hasMore && allData.length < statsDataLimit) {
       // If filter changed, abort
       if (state.activeFilterKey !== filterKey) {
         console.log('Filter changed, aborting fetchAllData');
         return;
       }
       const url = new URL('http://localhost:8000/api/latency-data');
-      url.searchParams.set('limit', CONFIG.fetchBatchSize.toString());
+      url.searchParams.set('limit', fetchBatchSize.toString());
       if (cursor) url.searchParams.set('cursor', cursor);
       Object.entries(filters).forEach(([key, value]) => {
         if (value) url.searchParams.set(key, value);
@@ -1417,6 +2683,10 @@ const fetchAllData = async (filters = {}) => {
     processDataForStatistics(allData);
     console.log(`🎬 Queued ${state.pendingArcs.length} arcs for animation`);
     console.log('✅ Data fetching complete - stats updated, animation queued');
+    
+    // Update filter dropdowns with the fetched data
+    updateFilterDropdownsFromData(allData);
+    
     // Call ticker update after stats are ready
     updateTickerWithSummaries();
     
@@ -1497,27 +2767,136 @@ const generateFilterAnnouncement = (filters) => {
   const combined = announcements.join(', and ');
   return `🎯 FILTERED VIEW: Now showing focused performance ${combined}. Join the Qualoo network at qualoo.io to get premium insights for your region.`;
 };
-
-const applyFilters = () => {
+const applyFilters = async () => {
+  console.log('🔍 Apply filters button clicked!');
+  
+  // Get date values from HTML inputs
+  const startDateValue = document.getElementById('filter-start-date')?.value;
+  const endDateValue = document.getElementById('filter-end-date')?.value;
+  
+  const sourceCountry = document.getElementById('source-country').value;
+  const destCountry = document.getElementById('dest-country').value;
+  
+  // Convert destination country code to full name (API expects full names for destinations)
+  const destCountryForAPI = destCountry ? getCountryName(destCountry) : '';
+  
   const filters = {
-    source_country: document.getElementById('source-country').value,
+    start_date: startDateValue ? new Date(startDateValue).toISOString() : '',
+    end_date: endDateValue ? new Date(endDateValue).toISOString() : '',
+    source_country: sourceCountry,  // Source uses 2-letter codes
     source_region: document.getElementById('source-region').value,
     operator: document.getElementById('source-operator').value,
     network_type: document.getElementById('network-type').value,
-    dest_country: document.getElementById('dest-country').value,
+    dest_country: destCountryForAPI,  // Destination uses full country names
     dest_region: document.getElementById('dest-region').value
   };
+  
+  console.log('📅 Applying filters:', filters);
+  console.log('🌍 Source Country (API will get code):', sourceCountry);
+  console.log('🌍 Dest Country (API will get full name):', destCountry, '→', destCountryForAPI);
+  
   state.filters = filters;
   clearArcs();
+  state.allDataForStats = [];
+  
+  // Special case: If same country selected for BOTH source and dest, fetch OR logic
+  // This allows querying "all traffic FROM Singapore OR TO Singapore"
+  if (sourceCountry && destCountry && sourceCountry === destCountry) {
+    console.log(`🔀 Fetching all traffic FROM ${sourceCountry} (${getCountryName(sourceCountry)}) OR TO ${sourceCountry} (${getCountryName(sourceCountry)})`);
+    
+    // Create base filters with only dates (clear all other filters for OR query)
+    const baseFilters = {
+      start_date: filters.start_date,
+      end_date: filters.end_date
+    };
+    
+    // Convert country code to full name for destination queries (API uses full names for dest)
+    const countryFullName = getCountryName(sourceCountry);
+    console.log(`🔄 Converting country code: ${sourceCountry} → ${countryFullName}`);
+    
+    // Fetch traffic FROM the country (outbound): source=SG, dest=any
+    const filtersFrom = {
+      ...baseFilters,
+      source_country: sourceCountry,  // Source uses 2-letter code
+      dest_country: '',  // Empty means "any destination"
+      source_region: '',
+      dest_region: '',
+      operator: '',
+      network_type: ''
+    };
+    console.log('📤 Fetching OUTBOUND traffic (source=' + sourceCountry + ', dest=any):', filtersFrom);
+    await fetchAllData(filtersFrom, { increasedLimits: true });
+    const dataFrom = [...state.allDataForStats];
+    console.log(`📤 Outbound data fetched: ${dataFrom.length} records`);
+    if (dataFrom.length > 0) {
+      console.log('Sample outbound:', dataFrom.slice(0, 3).map(d => ({ 
+        id: d.id, 
+        source: d.source_country, 
+        dest: d.dest_country,
+        operator: d.operator 
+      })));
+    }
+    
+    // Fetch traffic TO the country (inbound): source=any, dest=Singapore (full name!)
+    const filtersTo = {
+      ...baseFilters,
+      source_country: '',  // Empty means "any source"
+      dest_country: countryFullName,  // Destination uses FULL country name, not code!
+      source_region: '',
+      dest_region: '',
+      operator: '',
+      network_type: ''
+    };
+    console.log('📥 Fetching INBOUND traffic (source=any, dest=' + countryFullName + '):', filtersTo);
+    await fetchAllData(filtersTo, { increasedLimits: true });
+    const dataTo = [...state.allDataForStats];
+    console.log(`📥 Inbound data fetched: ${dataTo.length} records`);
+    if (dataTo.length > 0) {
+      console.log('Sample inbound:', dataTo.slice(0, 3).map(d => ({ 
+        id: d.id, 
+        source: d.source_country, 
+        dest: d.dest_country,
+        operator: d.operator 
+      })));
+    }
+    
+    // Merge and deduplicate by ID
+    const mergedData = [...dataFrom, ...dataTo];
+    const uniqueData = mergedData.filter((item, index, self) => 
+      index === self.findIndex(t => t.id === item.id)
+    );
+    
+    state.allDataForStats = uniqueData;
+    state.pendingArcs = uniqueData;
+    
+    console.log(`✅ Merged ${dataFrom.length} outbound + ${dataTo.length} inbound = ${uniqueData.length} unique records`);
+    console.log(`🌍 Unique operators in results:`, [...new Set(uniqueData.map(d => d.operator))].filter(Boolean).slice(0, 10));
+    
+    // Update stats and UI
+    processDataForStatistics(uniqueData);
+    updateFilterDropdownsFromData(uniqueData);
+    
+    speakQueued(`Showing all network traffic from ${getCountryName(sourceCountry)} or to ${getCountryName(sourceCountry)}. Found ${dataFrom.length} outbound and ${dataTo.length} inbound tests.`, window.TTS_PRIORITY.INFO);
+  } else {
+    // Normal filtering
   fetchAllData(filters);
 
   // Announce the filter change
   const announcement = generateFilterAnnouncement(filters);
   speakQueued(announcement, window.TTS_PRIORITY.INFO);
+  }
 };
 
 const clearFilters = () => {
-  // Reset all filter dropdowns
+  console.log('🧹 Clearing all filters');
+  
+  // Reset all filter dropdowns and date inputs
+  const startDateInput = document.getElementById('filter-start-date');
+  const endDateInput = document.getElementById('filter-end-date');
+  
+  if (startDateInput) startDateInput.value = '';
+  if (endDateInput) endDateInput.value = '';
+  
   document.getElementById('source-country').value = '';
   document.getElementById('source-region').value = '';
   document.getElementById('source-operator').value = '';
@@ -1527,6 +2906,7 @@ const clearFilters = () => {
 
   state.filters = {};
   clearArcs();
+  state.allDataForStats = [];
   fetchAllData({});
 
   // Announce clearing filters
@@ -1825,7 +3205,8 @@ async function processAndFeedTickerFromApi() {
 const scheduleBatchProcessing = () => {
   if (state.batchScheduleId) clearInterval(state.batchScheduleId);
   state.batchScheduleId = setInterval(() => {
-    if (state.pendingArcs.length > 0 && state.flightArcs.length < CONFIG.maxActiveArcs) {
+    const maxActiveArcs = state.currentMaxActiveArcs || CONFIG.maxActiveArcs;
+    if (state.pendingArcs.length > 0 && state.flightArcs.length < maxActiveArcs) {
       processPendingArcs();
     } else if (state.pendingArcs.length === 0 && !state.hasMoreData) {
       console.log('🎬 All animation arcs processed (will loop infinitely as they fade)');
@@ -1842,7 +3223,7 @@ let isOtherAudioPlaying = false;
 let audioCheckInterval = null;
 let grokDetectionEnabled = false;
 let lastGrokDetection = 0;
-const GROK_COOLDOWN = 10000; // 10 seconds cooldown after detecting "grok"
+const GROK_COOLDOWN = 4000; // shorter cooldown after detecting other voice
 
 // Initialize audio detection
 const initAudioDetection = async () => {
@@ -1885,11 +3266,18 @@ const startAudioMonitoring = () => {
     
     // Calculate average audio level with better sensitivity
     const average = dataArray.reduce((sum, value) => sum + value, 0) / bufferLength;
-    const threshold = 8; // Lower threshold for better detection
-    const grokThreshold = threshold * 1.5; // Separate threshold for Grok detection
+    const threshold = 15; // Increased threshold to avoid false positives from ambient noise
+    const grokThreshold = threshold * 1.8; // Separate threshold for Grok detection
     
     const wasPlaying = isOtherAudioPlaying;
     isOtherAudioPlaying = average > threshold;
+    
+    // Log audio levels every 5 seconds for debugging
+    if (!state.lastAudioLevelLog) state.lastAudioLevelLog = 0;
+    if (Date.now() - state.lastAudioLevelLog > 5000) {
+      console.log(`🎵 Audio level: ${average.toFixed(2)} (threshold: ${threshold}, playing: ${isOtherAudioPlaying})`);
+      state.lastAudioLevelLog = Date.now();
+    }
     
     if (isOtherAudioPlaying && !wasPlaying) {
       console.log('🔊 Detected other audio playing, pausing TTS');
@@ -1946,8 +3334,35 @@ const stopAudioMonitoring = () => {
 // TTS constants are defined in config.js and exposed on window.*
 
 async function speakQueued(text, priority = window.TTS_PRIORITY.INFO) {
+  // Normalize numbers for better speech: round ms and expand units
+  try {
+    let normalized = String(text)
+      .replace(/(\d+\.\d+|\d+)\s*ms\b/gi, (_, n) => `${Math.round(parseFloat(n))} milliseconds`)
+      .replace(/\bms\b/gi, 'milliseconds')
+      .replace(/\bp95\b\s*/gi, 'upper latency ');
+    // Ensure we don't send dangling fragments
+    normalized = normalized.trim();
+    if (!/[.!?]$/.test(normalized)) normalized += '.';
+    ttsQueue.push({ text: normalized, priority });
+  } catch {
   ttsQueue.push({ text, priority });
+  }
   if (!ttsSpeaking) processTTSQueue();
+}
+
+// Deduplicated speaking to avoid repeating the same announcements
+function speakOnce(key, text, priority = window.TTS_PRIORITY.INFO) {
+  if (!state.recentSpokenKeys) state.recentSpokenKeys = new Set();
+  if (state.recentSpokenKeys.has(key)) return;
+  // Cap memory
+  if (!state.recentSpokenQueue) state.recentSpokenQueue = [];
+  state.recentSpokenKeys.add(key);
+  state.recentSpokenQueue.push(key);
+  if (state.recentSpokenQueue.length > 100) {
+    const old = state.recentSpokenQueue.shift();
+    state.recentSpokenKeys.delete(old);
+  }
+  speakQueued(text, priority);
 }
 
 async function processTTSQueue() {
@@ -1963,11 +3378,11 @@ async function processTTSQueue() {
   if (audioDetectionEnabled && isOtherAudioPlaying) {
     console.log('⏸️ Other audio detected, waiting for silence before TTS...');
     let waitTime = 0;
-    const maxWaitTime = 30000; // 30 seconds wait for silence
+    const maxWaitTime = 8000; // shorter wait for silence
     
     while (isOtherAudioPlaying && waitTime < maxWaitTime) {
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Check every second
-      waitTime += 1000;
+      await new Promise(resolve => setTimeout(resolve, 500)); // Check twice a second
+      waitTime += 500;
     }
     
     if (waitTime >= maxWaitTime) {
@@ -1988,40 +3403,129 @@ async function processTTSQueue() {
   const { text, priority } = ttsQueue.shift();
   
   try {
-    const response = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'tts-1',
-        input: text,
-        voice: 'alloy'
-      })
-    });
+    // ElevenLabs can handle multilingual directly; keep original text
+    let speakText = text;
+    const targetLang = localStorage.getItem('TTS_LANG') || 'en';
+    // Choose effective language: force EN for brand lines; optionally rotate languages for variety
+    const isBrandLine = /\bqualoo(\.io)?\b/i.test(speakText);
+    let chosenLang = targetLang;
+    if (isBrandLine) {
+      chosenLang = 'en';
+    } else {
+      const mixEnabled = (localStorage.getItem('TTS_MIX_LANGS') ?? 'true') !== 'false';
+      if (mixEnabled) {
+        if (!state.langMixPool) state.langMixPool = ['en', 'es', 'fr'];
+        if (typeof state.langMixIndex !== 'number') state.langMixIndex = 0;
+        chosenLang = state.langMixPool[state.langMixIndex % state.langMixPool.length] || targetLang;
+        state.langMixIndex = (state.langMixIndex + 1) % state.langMixPool.length;
+      }
+    }
+
+    // Provider routing
+    const provider = localStorage.getItem('TTS_PROVIDER') || 'openai';
+    let response;
+    
+    console.log(`🎤 TTS Request: Provider=${provider}, Text="${speakText.substring(0, 50)}..."`);
+    
+    if (provider === 'eleven') {
+      const voiceId = localStorage.getItem('ELEVEN_VOICE_ID') || 'yf18OYKcMjTlVAGNuq5t';
+      const elevenDevKey = localStorage.getItem('ELEVENLABS_API_KEY') || '';
+      // Phonetic brand hint for TTS only (does not change on-screen text)
+      const textForTTS = (speakText || '').replace(/\bQualoo(\.io)?\b/gi, (_, d) => d ? 'Kwaloo dot io' : 'Kwaloo');
+      console.log(`🎙️ Using ElevenLabs API`);
+      response = await fetch('http://localhost:8000/api/tts/eleven', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(elevenDevKey ? { 'X-ElevenLabs-Key': elevenDevKey } : {})
+        },
+        body: JSON.stringify({ text: textForTTS, voiceId, model: 'eleven_multilingual_v2', language_code: chosenLang, output_format: 'mp3_44100_128' })
+      });
+    } else {
+    const browserKey = window.OPENAI_API_KEY || '';
+    if (browserKey) {
+        console.log(`🎙️ Using OpenAI API (browser key)`);
+      response = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${browserKey}`,
+          'Content-Type': 'application/json'
+        },
+          body: JSON.stringify({ model: 'gpt-4o-mini-tts', input: speakText, voice: 'nova' })
+      });
+    } else {
+        console.log(`🎙️ Using OpenAI API (server proxy - requires OPENAI_API_KEY env var on server)`);
+      response = await fetch('http://localhost:8000/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: speakText, voice: 'nova', model: 'gpt-4o-mini-tts' })
+      });
+    }
+    }
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(`❌ TTS HTTP error ${response.status}:`, errText);
+      
+      // Provide helpful error messages
+      if (response.status === 400 && errText.includes('OPENAI_API_KEY')) {
+        console.error(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  TTS ERROR: OpenAI API Key Not Configured
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+To fix this, you have 2 options:
+
+OPTION 1 (Recommended): Set server environment variable
+  - Add OPENAI_API_KEY to your .env file
+  - Restart the server
+
+OPTION 2: Set browser API key
+  - Open the TTS Controls panel (top menu)
+  - Enter your OpenAI API key (starts with sk-)
+  - Click Save
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        `);
+      }
+      throw new Error(`TTS failed: ${response.status} - ${errText}`);
+    }
+
     const blob = await response.blob();
+    console.log(`✅ TTS audio received (${(blob.size / 1024).toFixed(1)} KB)`);
+
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
+    audio.volume = 1.0; // Ensure volume is at maximum
+    
+    console.log(`🔊 Playing TTS audio...`);
+    
     await new Promise((resolve, reject) => {
-      audio.onended = resolve;
-      audio.onerror = reject;
-      audio.play();
+      audio.onended = () => {
+        console.log(`✅ TTS audio playback finished`);
+        resolve();
+      };
+      audio.onerror = (err) => {
+        console.error(`❌ Audio playback error:`, err);
+        reject(err);
+      };
+      audio.play().catch(err => {
+        console.error(`❌ Audio.play() failed:`, err);
+        reject(err);
+      });
     });
     
     // Extended cooldown after audio finishes
-    console.log('🎤 Audio finished, waiting 15 seconds before next TTS...');
+    console.log(`🎤 Audio finished, waiting ${window.POST_TTS_COOLDOWN / 1000} seconds before next TTS...`);
     lastTTSFinishTime = Date.now();
     await new Promise(resolve => setTimeout(resolve, window.POST_TTS_COOLDOWN));
     
   } catch (error) {
     console.error('TTS error:', error);
+    showError(error?.message || 'TTS playback failed');
   }
   processTTSQueue();
 }
-
-
-
 const animateArcs = (now, delta) => {
   let lastDebugLog = 0;
   const debugInterval = 1000;
@@ -2071,28 +3575,30 @@ const animateArcs = (now, delta) => {
       return false;
     }
 
-    const drawTime = arc.arcDuration - CONFIG.arcFadeTime;
+  const drawTime = Math.max(500, arc.arcDuration - CONFIG.arcFadeTime);
 
     let fadeOpacity = 1;
     if (age > drawTime) {
       const fadeAge = age - drawTime;
-      fadeOpacity = Math.max(0.1, (CONFIG.arcFadeTime - fadeAge) / CONFIG.arcFadeTime ** 1.5);
+      // Keep arcs more opaque while fading
+      fadeOpacity = Math.max(0.7, (CONFIG.arcFadeTime - fadeAge) / (CONFIG.arcFadeTime * 0.9));
     }
 
     arc.tube.material.opacity = fadeOpacity;
     arc.sourceDot.material.opacity = fadeOpacity;
     arc.destDot.material.opacity = fadeOpacity;
 
-    let particleOpacity = fadeOpacity * CONFIG.glowIntensity;
+    let particleOpacity = Math.max(0.7, fadeOpacity * CONFIG.glowIntensity);
     if (age > arc.arcDuration) particleOpacity = 0;
     arc.particle.material.opacity = particleOpacity;
 
     if (age > arc.arcDuration && !arc.isTrace) {
       arc.isTrace = true;
-      const newGeometry = new THREE.TubeGeometry(arc.tube.geometry.parameters.path, arc.tube.geometry.parameters.tubularSegments, 0.009, 8, false);
+      const newGeometry = new THREE.TubeGeometry(arc.tube.geometry.parameters.path, arc.tube.geometry.parameters.tubularSegments, 0.003, 12, false);
       arc.tube.geometry.dispose();
       arc.tube.geometry = newGeometry;
-      arc.tube.material.blending = THREE.AdditiveBlending;
+      arc.tube.material.blending = THREE.NormalBlending;
+      arc.tube.material.opacity = 1.0;
     }
 
     let drawProgress = 0;
@@ -2116,9 +3622,12 @@ const animateArcs = (now, delta) => {
       const newPoints = arc.points.slice(0, pointIndex + 1);
       if (newPoints.length < 2) return true;
       const newCurve = new THREE.CatmullRomCurve3(newPoints);
-      const newGeometry = new THREE.TubeGeometry(newCurve, newPoints.length - 1, 0.005, 8, false);
+      const newGeometry = new THREE.TubeGeometry(newCurve, newPoints.length - 1, 0.004, 12, false);
       arc.tube.geometry.dispose();
       arc.tube.geometry = newGeometry;
+      // Ease in opacity to avoid initial white flash
+      const eased = Math.max(0.2, Math.pow(drawProgress, 0.6));
+      arc.tube.material.opacity = Math.min(0.9, eased);
     }
 
     if (arc.warning) {
@@ -2262,15 +3771,28 @@ const updateHUD = (now) => {
     }
   };
 
-  state.flightArcs.forEach(arc => processData(arc));
-  state.pendingArcs.forEach(data => processData(data));
+  // Process active arcs for real-time visualization
+  state.flightArcs.forEach(arc => processData(arc, true));
+  state.pendingArcs.forEach(data => processData(data, true));
+  
+  // ALSO process all historical data for accurate statistics (last couple hours)
+  if (state.allDataForStats && state.allDataForStats.length > 0) {
+    state.allDataForStats.forEach(data => processData(data, false));
+  }
 
   const totalArcs = allLatencies.length;
   avgLatency = totalArcs > 0 ? Math.round(allLatencies.reduce((a, b) => a + b, 0) / totalArcs) : 0;
   console.log(`📊 Average latency calculation: ${allLatencies.length} latencies, total: ${allLatencies.reduce((a, b) => a + b, 0)}, avg: ${avgLatency}ms`);
   breachRate = totalArcs > 0 ? (breaches / totalArcs * 100).toFixed(0) : 0;
   complianceRate = (100 - breachRate).toFixed(0);
-  worstPerformers = Object.values(allOperators).map(value => ({op: value.op, country: value.country, avg: Math.round(value.sum / value.count), poorCount: value.poorCount})).sort((a,b) => b.avg - a.avg).slice(0,5);
+  worstPerformers = Object.values(allOperators).map(value => ({
+    op: value.op, 
+    country: value.country, 
+    avg: Math.round(value.sum / value.count), 
+    poorCount: value.poorCount,
+    count: value.count,
+    compliance: value.count > 0 ? Math.round(((value.count - value.poorCount) / value.count) * 100) : 0
+  })).sort((a,b) => b.avg - a.avg).slice(0,5);
   topWorstCountries = Object.values(allCountries).map(value => ({country: value.country, avg: Math.round(value.sum / value.count), operatorsCount: value.operators.size})).sort((a,b) => b.avg - a.avg).slice(0,5);
   topBreachesOperators = Object.values(breachesByOperator).map(value => ({op: value.op, country: value.country, breaches: value.breaches, total: value.total, ratio: value.total > 0 ? value.breaches / value.total : 0})).sort((a,b) => b.ratio - a.ratio).slice(0,5);
   topBreachesCountries = Object.entries(breachesByCountry).map(([country, {breaches, total}]) => ({country, breaches, total, ratio: total > 0 ? breaches / total : 0})).sort((a,b) => b.ratio - a.ratio).slice(0,5).filter(c => c.country !== 'Unknown');
@@ -2290,12 +3812,19 @@ const updateHUD = (now) => {
 
   let alertsHTML = '';
   let alertsText = '';
-  worstPerformers.forEach(p => {
-    if (p.avg > 400) {
-      alertsHTML += `<div class="alert">High latency alert for ${p.op} in ${getCountryName(p.country)}: ${p.avg} ms</div>`;
-      alertsText += `High latency alert for ${p.op} in ${getCountryName(p.country)}: ${p.avg} ms. `;
+  
+  // Show only the worst performer (one alert at a time to avoid stacking)
+  const criticalPerformers = worstPerformers.filter(p => p.avg > 400);
+  if (criticalPerformers.length > 0) {
+    const worst = criticalPerformers[0]; // Just show the worst one
+    alertsHTML = `<div class="alert">⚠️ High latency: ${worst.op} in ${getCountryName(worst.country)}: ${worst.avg} ms</div>`;
+    alertsText = `High latency alert for ${worst.op} in ${getCountryName(worst.country)}: ${worst.avg} ms. `;
+    
+    // Add count of other alerts if there are more
+    if (criticalPerformers.length > 1) {
+      alertsHTML += `<div style="font-size: 11px; color: #ffa500; margin-top: 5px;">+${criticalPerformers.length - 1} more alerts</div>`;
     }
-  });
+  }
 
   const sourceRegionsWithData = Object.entries(regionsMatrix)
     .filter(([_, dests]) => Object.values(dests || {}).some(val => val?.count > 0))
@@ -2483,6 +4012,18 @@ const updateHUD = (now) => {
 
   const hudElement = document.getElementById('hud-stats');
   if (hudElement) {
+    // Persist a compact snapshot for TTS highlights
+    try {
+      state.latestHUD = {
+        updatedAt: Date.now(),
+        complianceRate,
+        avgLatency: state.avgLatency,
+        operatorStats,
+        countryStatsEnhanced,
+        topBreachesOperators,
+        topBreachesCountries
+      };
+    } catch {}
     const hudStatsString = JSON.stringify({
       complianceRate,
       avgLatency: state.avgLatency,
@@ -2501,19 +4042,19 @@ const updateHUD = (now) => {
       hudElement.innerHTML = `
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
-          #hud-stats { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; font-family: 'Roboto', sans-serif; color: #ffffff; z-index: 2; }
+#hud-stats { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; font-family: 'Orbitron', sans-serif; color: #ffffff; z-index: 10050; }
           .title { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; font-size: 24px; }
           .title img { width: 40px; margin-right: 10px; opacity: 0.8; }
           .kpi-cards { position: absolute; top: 60px; left: 50%; transform: translateX(-50%); display: flex; justify-content: center; gap: 20px; }
-          .kpi-card { background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 8px; text-align: center; box-shadow: 0 0 10px rgba(173,216,230,0.2); }
+          .kpi-card { background: linear-gradient(135deg, rgba(0,0,0,0.6), rgba(0,0,0,0.9)); padding: 10px 20px; border-radius: 10px; text-align: center; box-shadow: 0 0 20px rgba(0,229,255,0.25), inset 0 0 12px rgba(0,229,255,0.15); border: 1px solid rgba(0,229,255,0.25); }
           .kpi-card h4 { margin: 0; color: #add8e6; font-size: 16px; }
           .kpi-card p { margin: 5px 0 0; font-size: 24px; font-weight: bold; }
-          .left-column { position: absolute; left: 20px; top: 120px; width: 520px; padding: 15px; background: rgba(0,0,0,0.7); border-radius: 8px; overflow-y: auto; max-height: calc(100% - 150px); box-shadow: 0 0 10px rgba(173,216,230,0.2); }
-          .right-column { position: absolute; right: 20px; top: 120px; width: 520px; padding: 15px; background: rgba(0,0,0,0.7); border-radius: 8px; overflow-y: auto; max-height: calc(100% - 150px); box-shadow: 0 0 10px rgba(173,216,230,0.2); }
+          .left-column { position: absolute; left: 20px; top: 120px; width: 572px; padding: 15px; background: rgba(10,20,30,0.75); border-radius: 12px; overflow-y: auto; max-height: calc(100% - 150px); box-shadow: 0 8px 32px rgba(0,229,255,0.18); border: 1px solid rgba(0,229,255,0.2); backdrop-filter: blur(6px); }
+          .right-column { position: absolute; right: 20px; top: 120px; width: 572px; padding: 15px; background: rgba(10,20,30,0.75); border-radius: 12px; overflow-y: auto; max-height: calc(100% - 150px); box-shadow: 0 8px 32px rgba(0,229,255,0.18); border: 1px solid rgba(0,229,255,0.2); backdrop-filter: blur(6px); }
           h3 { color: #add8e6; font-size: 18px; margin-bottom: 10px; }
-          table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: auto; }
-          th, td { border: 1px solid rgba(173,216,230,0.3); padding: 4px 6px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          th { background: rgba(173,216,230,0.18); color: #add8e6; font-size: 12px; height: 110px; vertical-align: bottom; writing-mode: vertical-rl; transform: rotate(180deg); letter-spacing: 1px; }
+          table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; table-layout: auto; }
+          th, td { border-bottom: 1px solid rgba(0,229,255,0.18); padding: 6px 8px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          th { background: linear-gradient(180deg, rgba(0,229,255,0.18), rgba(0,229,255,0.06)); color: #00e5ff; font-size: 12px; height: 42px; vertical-align: middle; writing-mode: initial; transform: none; letter-spacing: 1px; position: sticky; top: 0; z-index: 1; }
           tr th:first-child, tr td:first-child { writing-mode: initial; transform: none; text-align: left; }
           .operator-col { min-width: 120px; max-width: 180px; }
           .country-col { min-width: 60px; max-width: 90px; }
@@ -2528,14 +4069,14 @@ const updateHUD = (now) => {
           .matrix-container { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); width: auto; padding: 5px; background: rgba(0,0,0,0.7); border-radius: 8px; overflow-x: auto; max-height: 200px; box-shadow: none; font-size: 10px; }
           .matrix-container table { font-size: 10px; }
           .matrix-container th, .matrix-container td { padding: 4px; }
-          .alerts-container { position: absolute; top: 10px; right: 20px; padding: 10px; background: rgba(0,0,0,0.7); border-radius: 8px; box-shadow: 0 0 10px rgba(173,216,230,0.2); z-index: 3; }
+          .alerts-container { position: absolute; top: 10px; right: 20px; padding: 10px; background: rgba(0,0,0,0.85); border-radius: 8px; box-shadow: 0 0 10px rgba(173,216,230,0.2); z-index: 3; max-width: 300px; min-height: 60px; max-height: 120px; overflow: hidden; }
           .matrix-table h3 { text-align: center; }
           .good { color: #00e676; font-weight: bold; }
           .moderate { color: #ffd600; font-weight: bold; }
           .bad { color: #ff1744; font-weight: bold; }
         </style>
         <div class="title">
-          <img src="./logo white.png" alt="Qualoo Live World View" style="max-height: 60px; width: auto;">
+          <img src="./logo white.png" alt="Qualoo Live World View" style="max-height: 40px; width: auto;">
         </div>
         <div class="kpi-cards">
           <div class="kpi-card">
@@ -3080,16 +4621,17 @@ const createPersistentTicker = () => {
   tickerContainer.style.backdropFilter = 'blur(6px)';
   tickerContainer.style.boxShadow = '0 -2px 24px 0 rgba(0,0,0,0.5)';
   tickerContainer.style.overflow = 'hidden';
-  tickerContainer.style.height = '120px';
+  tickerContainer.style.height = '160px';
   tickerContainer.style.display = 'flex';
   tickerContainer.style.flexDirection = 'column';
   tickerContainer.style.alignItems = 'center';
+  tickerContainer.style.pointerEvents = 'none';
   tickerContainer.innerHTML = `
-    <div style="width:100%;display:flex;align-items:center;justify-content:center;padding:0 0 4px 0;">
-      <span style="background:#d50000;color:#fff;font-weight:bold;padding:4px 16px;border-radius:16px;margin-right:18px;font-size:18px;letter-spacing:2px;box-shadow:0 0 8px #d50000;animation:pulseLive 1.2s infinite alternate;">LIVE</span>
-      <span style="font-size:2.1rem;font-family:'Orbitron',sans-serif;font-weight:700;letter-spacing:2px;color:#fff;text-shadow:0 2px 8px #000,0 0 16px #00e5ff;">Global Internet Pulse</span>
+    <div style="width:100%;display:flex;align-items:center;justify-content:center;padding:8px 0 10px 0;">
+      <span style="background:#d50000;color:#fff;font-weight:bold;padding:10px 28px;border-radius:16px;margin-right:22px;font-size:28px;letter-spacing:2px;box-shadow:0 0 8px #d50000;animation:pulseLive 1.2s infinite alternate;">LIVE</span>
+      <span style="font-size:3.2rem;font-family:'Orbitron',sans-serif;font-weight:700;letter-spacing:2px;color:#fff;text-shadow:0 2px 8px #000,0 0 16px #00e5ff;">Global Internet Pulse</span>
     </div>
-    <div class="ticker-row" style="width:120vw;overflow:hidden;display:flex;align-items:center;height:38px;margin-bottom:2px;">
+    <div class="ticker-row" style="width:120vw;overflow:hidden;display:flex;align-items:center;height:90px;margin-bottom:8px;">
       <div class="ticker-inner" style="display:flex;align-items:center;gap:32px;white-space:nowrap;will-change:transform;"></div>
     </div>
   `;
@@ -3112,7 +4654,6 @@ const createPersistentTicker = () => {
     document.head.appendChild(style);
   }
 };
-
 const renderTickerQueue = () => {
   const inner = document.querySelector('#news-ticker-container .ticker-inner');
   if (!inner) {
@@ -3145,7 +4686,7 @@ const renderTickerQueue = () => {
     const pill = document.createElement('div');
     pill.style.flex = '0 0 auto';
     pill.style.margin = '0 18px';
-    pill.style.padding = '10px 20px';
+    pill.style.padding = '16px 28px';
     pill.style.borderRadius = '10px';
     pill.style.background = getBg(item.type);
     pill.style.color = '#fff';
@@ -3153,7 +4694,7 @@ const renderTickerQueue = () => {
     pill.style.alignItems = 'center';
     pill.style.gap = '14px';
     pill.style.fontFamily = 'Orbitron,sans-serif';
-    pill.style.fontSize = '1.1rem';
+    pill.style.fontSize = '2.0rem';
     pill.style.boxShadow = '0 2px 12px rgba(0,0,0,0.18)';
     pill.style.whiteSpace = 'nowrap';
     pill.style.overflow = 'hidden';
@@ -3162,6 +4703,36 @@ const renderTickerQueue = () => {
   });
   animateTicker();
 };
+
+// Periodically add worst ISPs (low compliance / high latency) to the ticker
+async function updateTickerFromHourlyIssues() {
+  try {
+    const res = await fetch('http://localhost:8000/api/hourly-issues');
+    if (!res.ok) return;
+    const data = await res.json();
+    const issues = data?.issues || [];
+    if (!Array.isArray(issues) || issues.length === 0) return;
+    // Prefer CRITICAL/MAJOR first, then WARNING
+    const scored = issues.map((it) => ({
+      it,
+      // Rank by severity and p95 over target
+      sev: it.severity === 'CRITICAL' ? 3 : (it.severity === 'MAJOR' ? 2 : 1),
+      gap: Math.max(0, parseFloat(it.p95_ms) - (it.is_same_region ? 100 : 300))
+    })).sort((a,b) => (b.sev - a.sev) || (b.gap - a.gap) || (b.it.loss_pct - a.it.loss_pct));
+
+    const top = scored.slice(0, 8).map(s => s.it);
+    top.forEach((it) => {
+      const country = getCountryName?.(it.src_iso2) || it.src_country || it.src_iso2 || '';
+      const comp = (it.eff_compliance_pct != null ? it.eff_compliance_pct : it.comp_300ms_pct);
+      const compStr = (comp == null || isNaN(comp)) ? '-' : `${Number(comp).toFixed(1)}%`;
+      const lossStr = (it.loss_pct == null || isNaN(it.loss_pct)) ? '-' : `${Number(it.loss_pct).toFixed(1)}%`;
+      const msg = `⚠️ ${it.operator_name} ${country ? '('+country+') ' : ''}| p95 ${Number(it.p95_ms).toFixed(0)}ms | compliance ${compStr} | loss ${lossStr}`;
+      addToTickerQueue(msg, it.severity === 'CRITICAL' ? 'critical_operator' : (it.severity === 'MAJOR' ? 'worst' : 'route_issue'));
+    });
+  } catch (e) {
+    console.warn('updateTickerFromHourlyIssues failed', e);
+  }
+}
 
 const animateTicker = () => {
   const inner = document.querySelector('#news-ticker-container .ticker-inner');
@@ -3325,14 +4896,31 @@ const pollLatestTest = async () => {
     const latest = data.tests[0];
     if (state.lastTestId !== latest.id) {
       state.lastTestId = latest.id;
+      
+      // Add to historical data for statistics (with rolling window to prevent unlimited growth)
+      if (!state.allDataForStats) state.allDataForStats = [];
+      state.allDataForStats.push({
+        ...latest,
+        latency: parseFloat(latest.avgTime) || 0
+      });
+      
+      // Keep only last 4 hours of data (4 * 3600 / 10 = ~1440 tests)
+      // Or up to CONFIG.statsDataLimit (50000)
+      const maxDataPoints = Math.min(CONFIG.statsDataLimit, 14400); // 4 hours at 1 test per 10 seconds
+      if (state.allDataForStats.length > maxDataPoints) {
+        state.allDataForStats = state.allDataForStats.slice(-maxDataPoints);
+      }
+      
       const countryName = countryCodeToName[latest.source_country] || latest.source_country;
       const latency = parseFloat(latest.avgTime) || 0;
     if (latency > 400) {
-      speakQueued(`BAD TEST: ${latest.operator} in ${countryName} - ${latency}ms. CRITICAL.`, window.TTS_PRIORITY.CRITICAL);
+      speakQueued(`BAD TEST: ${latest.operator} in ${countryName} - ${Math.round(latency)} milliseconds. CRITICAL.`, window.TTS_PRIORITY.CRITICAL);
     } else if (latency > 300) {
-      speakQueued(`POOR TEST: ${latest.operator} in ${countryName} - ${latency}ms.`, window.TTS_PRIORITY.BAD_PERFORMANCE);
+      speakQueued(`POOR TEST: ${latest.operator} in ${countryName} - ${Math.round(latency)} milliseconds.`, window.TTS_PRIORITY.BAD_PERFORMANCE);
     } else if (latency > 200) {
-      speakQueued(`SLOW TEST: ${latest.operator} in ${countryName} - ${latency}ms.`, window.TTS_PRIORITY.BAD_PERFORMANCE);
+      speakQueued(`SLOW TEST: ${latest.operator} in ${countryName} - ${Math.round(latency)} milliseconds.`, window.TTS_PRIORITY.BAD_PERFORMANCE);
+    } else if (latency < 100) {
+      speakQueued(`EXCELLENT TEST: ${latest.operator} in ${countryName} - ${Math.round(latency)} milliseconds. This is the benchmark!`, window.TTS_PRIORITY.NEW_TEST);
     } else {
       speakQueued(`New test: ${latest.operator} in ${countryName}.`, window.TTS_PRIORITY.NEW_TEST);
     }
@@ -3349,6 +4937,8 @@ const pollLatestTest = async () => {
         created_at: latest.created_at
       }, performance.now());
       animateQualooLogo();
+      
+      console.log(`📊 Historical data updated: ${state.allDataForStats.length} total tests in memory`);
     }
   } catch (e) {
     console.warn('Failed to poll latest test:', e);
@@ -3380,6 +4970,8 @@ const animate = (timestamp) => {
 
   state.controls.update();
   if (state.globe && state.autoRotate) state.globe.rotation.y += 0.0001 * delta;
+  if (state.cloudMesh) state.cloudMesh.rotation.y += 0.00005 * delta; // gentle cloud rotation
+  if (state.skyboxMesh) state.skyboxMesh.rotation.y += 0.00002 * delta; // slow space drift
 
 
   if (state.showCountries && state.countryGroup) {
@@ -3449,13 +5041,107 @@ const cleanup = () => {
   const toggleButton = document.getElementById('toggle-day-night');
   if (toggleButton) toggleButton.removeEventListener('click', toggleDayNight);
   const toggleCountriesButton = document.getElementById('toggle-countries');
-  if (toggleCountriesButton) toggleCountriesButton.removeEventListener('click', toggleCountries);
+  if (toggleCountriesButton) toggleCountriesButton.removeEventListener('click', toggleCountryBoundaries);
+  const toggleExplodedButton = document.getElementById('toggle-exploded-countries');
+  if (toggleExplodedButton) toggleExplodedButton.removeEventListener('click', toggleExplodedCountries);
   
   // Stop audio monitoring
   stopAudioMonitoring();
 };
 
-const toggleCountries = () => {
+// Toggle country boundaries visibility (show/hide)
+const toggleCountryBoundaries = () => {
+  state.showCountries = !state.showCountries;
+
+  // Show or hide all country lines
+  Object.entries(state.countryLines).forEach(([countryCode, lines]) => {
+    lines.forEach(line => {
+      line.visible = state.showCountries;
+      // Ensure material properties match current state
+      if (state.showCountries) {
+        if (state.explodedCountries) {
+          line.material.color.setHex(0xffffff);
+          line.material.opacity = 0.9;
+        } else {
+          line.material.color.setHex(0xadd8e6);
+          line.material.opacity = 0.5;
+        }
+        line.material.needsUpdate = true;
+      }
+    });
+  });
+
+  // Update button text if it exists
+  const toggleButton = document.getElementById('toggle-countries');
+  if (toggleButton) {
+    toggleButton.textContent = state.showCountries ?
+      '🗺️ Hide Country Outlines' : '🗺️ Show Country Outlines';
+  }
+
+  console.log('Country boundaries:', state.showCountries ? 'VISIBLE' : 'HIDDEN');
+};
+
+// Update the mode indicator overlay
+const updateModeIndicator = () => {
+  let indicator = document.getElementById('mode-indicator');
+  
+  // Create indicator if it doesn't exist
+  if (!indicator) {
+    indicator = document.createElement('div');
+    indicator.id = 'mode-indicator';
+    indicator.style.cssText = `
+      position: fixed;
+      top: 200px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 15px 30px;
+      background: linear-gradient(135deg, rgba(0,0,0,0.85), rgba(0,0,0,0.95));
+      border-radius: 12px;
+      border: 2px solid;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+      z-index: 1000;
+      font-family: 'Orbitron', monospace;
+      font-size: 16px;
+      font-weight: bold;
+      text-align: center;
+      backdrop-filter: blur(10px);
+      transition: all 0.3s ease;
+    `;
+    document.body.appendChild(indicator);
+  }
+  
+  console.log(`📊 Updating mode indicator: ${state.complianceMode ? 'COMPLIANCE' : 'LATENCY'} MODE`);
+  
+  // Update content based on mode
+  if (state.complianceMode) {
+    indicator.style.borderColor = '#00ff88';
+    indicator.style.boxShadow = '0 8px 32px rgba(0,255,136,0.4), inset 0 0 20px rgba(0,255,136,0.1)';
+    indicator.innerHTML = `
+      <div style="color: #00ff88; font-size: 18px; margin-bottom: 8px;">
+        ✓ COMPLIANCE MODE
+      </div>
+      <div style="color: #add8e6; font-size: 12px; line-height: 1.6;">
+        <div style="margin-bottom: 4px;">Same Region: <span style="color: #00ff88;">≤ 100ms</span> | Cross Region: <span style="color: #00ff88;">≤ 300ms</span></div>
+        <div style="font-size: 11px; opacity: 0.8;">🟢 Compliant | 🔴 Non-Compliant</div>
+      </div>
+    `;
+  } else {
+    indicator.style.borderColor = '#ff8800';
+    indicator.style.boxShadow = '0 8px 32px rgba(255,136,0,0.4), inset 0 0 20px rgba(255,136,0,0.1)';
+    indicator.innerHTML = `
+      <div style="color: #ff8800; font-size: 18px; margin-bottom: 8px;">
+        ⚡ LATENCY MODE
+      </div>
+      <div style="color: #add8e6; font-size: 12px; line-height: 1.6;">
+        <div>Displaying absolute network performance (milliseconds)</div>
+        <div style="font-size: 11px; opacity: 0.8; margin-top: 4px;">🟢 Fast | 🟡 Moderate | 🔴 Slow</div>
+      </div>
+    `;
+  }
+};
+
+// Toggle exploded countries view (3D projection)
+const toggleExplodedCountries = () => {
   state.explodedCountries = !state.explodedCountries;
 
   // Update all country line projections
@@ -3467,12 +5153,14 @@ const toggleCountries = () => {
     lines.forEach(line => {
       if (line.userData.originalCoords) {
         // Reproject coordinates at new radius
+        // GeoJSON coords are [lon, lat], latLongToVector3 expects (lat, lon, radius)
         const newPoints = line.userData.originalCoords.map(coord =>
-          latLongToVector3(coord[0], coord[1], projectionRadius)
+          latLongToVector3(coord[1], coord[0], projectionRadius)
         );
 
         // Update the geometry
-        line.geometry.setFromPoints(newPoints);
+        line.geometry.dispose(); // Dispose old geometry
+        line.geometry = new THREE.BufferGeometry().setFromPoints(newPoints);
         line.geometry.attributes.position.needsUpdate = true;
         line.geometry.computeBoundingSphere();
       }
@@ -3489,20 +5177,22 @@ const toggleCountries = () => {
   });
 
   // Update button text if it exists
-  const toggleCountriesButton = document.getElementById('toggle-countries');
-  if (toggleCountriesButton) {
-    toggleCountriesButton.textContent = state.explodedCountries ?
-      'Toggle Surface Countries' : 'Toggle Exploded Countries';
+  const toggleButton = document.getElementById('toggle-exploded-countries');
+  if (toggleButton) {
+    toggleButton.textContent = state.explodedCountries ?
+      '🌍 Surface Countries' : '🌌 Explode Countries';
   }
 
   console.log('Country mode:', state.explodedCountries ? 'EXPLODED' : 'SURFACE');
 };
 
 // Toggle between compliance and latency view modes
-const toggleComplianceView = () => {
+const toggleComplianceView = (isAutomatic = false) => {
+  const previousMode = state.complianceMode;
   state.complianceMode = !state.complianceMode;
   state.viewMode = state.complianceMode ? 'compliance' : 'latency';
-  console.log(`🔄 Switched to ${state.viewMode} view mode (complianceMode: ${state.complianceMode})`);
+  
+  console.log(`🔄 Mode switch: ${previousMode ? 'COMPLIANCE' : 'LATENCY'} → ${state.complianceMode ? 'COMPLIANCE' : 'LATENCY'} (automatic: ${isAutomatic})`);
   
   // Update button text
   const complianceButton = document.getElementById('toggle-compliance-view');
@@ -3516,6 +5206,30 @@ const toggleComplianceView = () => {
   if (latencyButton) {
     latencyButton.textContent = !state.complianceMode ? 'Latency View (Active)' : 'Toggle Latency View';
     latencyButton.style.background = !state.complianceMode ? 'rgba(255,136,0,0.3)' : 'rgba(255,255,255,0.2)';
+  }
+  
+  // Update mode indicator overlay - force update
+  setTimeout(() => updateModeIndicator(), 100);
+  
+  // TTS announcement for mode change
+  if (isAutomatic) {
+    if (state.complianceMode) {
+      const messages = [
+        "Switching to compliance view. Monitoring adherence to global latency targets: 100 milliseconds for same-region connections, and 300 milliseconds cross-region.",
+        "Compliance mode activated. We're now tracking which connections meet the standards: under 100ms within regions, under 300ms between regions.",
+        "Entering compliance analysis. Visualizing network performance against our targets: 100 millisecond same-region threshold, 300 millisecond cross-region threshold.",
+        "Switching view to compliance monitoring. Green connections meet the standard, red connections exceed acceptable latency limits."
+      ];
+      speakQueued(messages[Math.floor(Math.random() * messages.length)]);
+    } else {
+      const messages = [
+        "Returning to latency view. Now displaying absolute network performance in milliseconds across all connections.",
+        "Latency mode activated. Visualizing raw connection speeds and network performance worldwide.",
+        "Switching to latency analysis. Observing actual round-trip times across the global internet.",
+        "Back to latency view. Monitoring real-time connection speeds across continents and providers."
+      ];
+      speakQueued(messages[Math.floor(Math.random() * messages.length)]);
+    }
   }
   
   // Clear existing arcs and redraw with new mode
@@ -3644,8 +5358,45 @@ const addComplianceModeButton = () => {
   };
   
   document.body.appendChild(audioButton);
+  
+  // Add TTS test button
+  const testButton = document.createElement('button');
+  testButton.textContent = '🔊 Test TTS';
+  testButton.style.cssText = `
+    position: fixed;
+    bottom: 170px;
+    right: 20px;
+    padding: 12px 24px;
+    background: linear-gradient(45deg, #00e5ff, #00b0cc);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    z-index: 10000;
+    box-shadow: 0 4px 15px rgba(0, 229, 255, 0.3);
+    transition: all 0.3s ease;
+  `;
+  
+  testButton.onmouseover = () => {
+    testButton.style.transform = 'translateY(-2px)';
+    testButton.style.boxShadow = '0 6px 20px rgba(0, 229, 255, 0.5)';
+  };
+  
+  testButton.onmouseout = () => {
+    testButton.style.transform = 'translateY(0)';
+    testButton.style.boxShadow = '0 4px 15px rgba(0, 229, 255, 0.3)';
+  };
+  
+  testButton.onclick = () => {
+    console.log('🧪 Testing TTS system...');
+    console.log('Queue length:', ttsQueue.length, 'Speaking:', ttsSpeaking, 'Audio detection:', audioDetectionEnabled, 'Other audio playing:', isOtherAudioPlaying);
+    speakQueued('TTS system test. If you can hear this, your audio is working correctly. Qualoo network monitoring is active.', window.TTS_PRIORITY.CRITICAL);
+  };
+  
+  document.body.appendChild(testButton);
 };
-
 const init = async () => {
   createPersistentTicker();
   try {
@@ -3666,6 +5417,10 @@ const init = async () => {
     createGlobe();
     console.log('Globe creation completed');
 
+    // Use a rotating starfield background instead of a skybox mesh
+    try { disableCinematicSpaceBackground(); } catch {}
+    try { enableRotatingStarfield(); } catch {}
+
     const toggleButton = document.getElementById('toggle-day-night');
     if (toggleButton) {
       toggleButton.addEventListener('click', toggleDayNight);
@@ -3676,10 +5431,18 @@ const init = async () => {
 
     const toggleCountriesButton = document.getElementById('toggle-countries');
     if (toggleCountriesButton) {
-      toggleCountriesButton.addEventListener('click', toggleCountries);
-      console.log('Toggle countries button listener added');
+      toggleCountriesButton.addEventListener('click', toggleCountryBoundaries);
+      console.log('Toggle country boundaries button listener added');
     } else {
       console.log('Toggle countries button element not found - this is normal if the button is not in the HTML');
+    }
+
+    const toggleExplodedButton = document.getElementById('toggle-exploded-countries');
+    if (toggleExplodedButton) {
+      toggleExplodedButton.addEventListener('click', toggleExplodedCountries);
+      console.log('Toggle exploded countries button listener added');
+    } else {
+      console.log('Toggle exploded countries button element not found - this is normal if the button is not in the HTML');
     }
 
     // Add compliance/latency view toggle button listeners
@@ -3697,6 +5460,55 @@ const init = async () => {
       console.log('Toggle latency view button listener added');
     } else {
       console.log('Toggle latency view button element not found');
+    }
+
+    const settingsToggle = document.getElementById('settings-toggle');
+    if (settingsToggle) {
+      const menuEl = document.getElementById('menu');
+      settingsToggle.addEventListener('click', function () {
+        if (!menuEl) return;
+        var computed = window.getComputedStyle(menuEl).display;
+        var isShown = computed !== 'none';
+        var willShow = !isShown;
+        menuEl.style.display = willShow ? 'flex' : 'none';
+        // Compatibility for older/embedded browsers: avoid CSS transforms on native selects
+        if (willShow) {
+          menuEl.style.transform = 'none';
+          menuEl.style.left = 'auto';
+          menuEl.style.right = '20px';
+          menuEl.style.zIndex = '30010';
+          menuEl.style.pointerEvents = 'auto';
+        } else {
+          menuEl.style.right = '';
+          menuEl.style.left = '';
+          menuEl.style.transform = '';
+        }
+        if (menuEl.focus) menuEl.focus();
+      });
+      console.log('Settings toggle wired');
+    }
+
+    const toggleQualooBtn = document.getElementById('toggle-qualoo-colors');
+    if (toggleQualooBtn) {
+      toggleQualooBtn.addEventListener('click', () => {
+        state.qualooColorsMode = !state.qualooColorsMode;
+        state.qualooColorIndex = 0;
+        toggleQualooBtn.textContent = state.qualooColorsMode ? 'Qualoo Colors: ON' : 'Qualoo Colors';
+      });
+      console.log('Qualoo colors toggle added');
+    }
+
+    const toggleMusicBtn = document.getElementById('toggle-music-sync');
+    if (toggleMusicBtn) {
+      toggleMusicBtn.addEventListener('click', async () => {
+        state.musicSyncMode = !state.musicSyncMode;
+        toggleMusicBtn.textContent = state.musicSyncMode ? 'Music Sync: ON' : 'Music Sync';
+        // Initialize audio analyser if not ready
+        if (state.musicSyncMode && !audioDetectionEnabled) {
+          try { await initAudioDetection(); } catch (e) { console.warn('Music sync init failed:', e); }
+        }
+      });
+      console.log('Music sync toggle added');
     }
 
     const sourceCountries = await fetchUniqueValues('source_countries');
@@ -3717,13 +5529,73 @@ const init = async () => {
     const destRegions = await fetchUniqueValues('dest_regions');
     populateDropdown('dest-region', destRegions, { convertCountryCodes: true });
 
-    document.getElementById('toggle-filters').addEventListener('click', () => {
+    document.getElementById('toggle-filters').addEventListener('click', function () {
       const filtersPanel = document.getElementById('filters');
-      filtersPanel.classList.toggle('show');
+      if (!filtersPanel) return;
+      const showing = !filtersPanel.classList.contains('show');
+      filtersPanel.classList.toggle('show', showing);
+      // Ensure the panel is on top-level to avoid ancestor transforms clipping native dropdowns
+      try { if (filtersPanel.parentElement !== document.body) document.body.appendChild(filtersPanel); } catch {}
+      // In OBS Browser, native selects can be blocked by the WebGL canvas; disable canvas pointer events while filters are open
+      var canvas = (state && state.renderer) ? state.renderer.domElement : null;
+      if (canvas) {
+        canvas.style.pointerEvents = showing ? 'none' : 'auto';
+        canvas.style.zIndex = showing ? '0' : '10';
+      }
+      // Optionally pause orbit controls to avoid accidental drags beneath the panel
+      if (state && state.controls) state.controls.enabled = !showing;
+      // Raise panel above all
+      filtersPanel.style.zIndex = showing ? '30000' : '';
+      filtersPanel.style.position = 'fixed';
+      filtersPanel.style.pointerEvents = 'auto';
     });
 
     document.getElementById('apply-filters').addEventListener('click', applyFilters);
     document.getElementById('clear-filters').addEventListener('click', clearFilters);
+
+    // Wire up quick date range buttons
+    document.getElementById('filter-last-hour')?.addEventListener('click', () => {
+      const end = new Date();
+      const start = new Date(end.getTime() - 60 * 60 * 1000);
+      const startInput = document.getElementById('filter-start-date');
+      const endInput = document.getElementById('filter-end-date');
+      if (startInput) startInput.value = start.toISOString().slice(0, 16);
+      if (endInput) endInput.value = end.toISOString().slice(0, 16);
+      console.log('📅 Set date range to Last Hour');
+    });
+    
+    document.getElementById('filter-last-24h')?.addEventListener('click', () => {
+      const end = new Date();
+      const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+      const startInput = document.getElementById('filter-start-date');
+      const endInput = document.getElementById('filter-end-date');
+      if (startInput) startInput.value = start.toISOString().slice(0, 16);
+      if (endInput) endInput.value = end.toISOString().slice(0, 16);
+      console.log('📅 Set date range to Last 24 Hours');
+    });
+    
+    document.getElementById('filter-last-week')?.addEventListener('click', () => {
+      const end = new Date();
+      const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+      const startInput = document.getElementById('filter-start-date');
+      const endInput = document.getElementById('filter-end-date');
+      if (startInput) startInput.value = start.toISOString().slice(0, 16);
+      if (endInput) endInput.value = end.toISOString().slice(0, 16);
+      console.log('📅 Set date range to Last Week');
+    });
+
+    // Quick button to set both source and dest to the same country
+    document.getElementById('quick-both-directions')?.addEventListener('click', () => {
+      const sourceCountry = document.getElementById('source-country').value;
+      if (!sourceCountry) {
+        alert('Please select a source country first!');
+        return;
+      }
+      document.getElementById('dest-country').value = sourceCountry;
+      const countryName = getCountryName(sourceCountry);
+      console.log(`↕️ Set both source and destination to: ${sourceCountry} (${countryName})`);
+      alert(`✓ Ready to show all traffic FROM and TO ${countryName}\n\nClick "Apply Filters" to fetch the data.`);
+    });
 
     // Additional toggle button event listeners
     document.getElementById('toggle-rotation')?.addEventListener('click', () => {
@@ -3776,6 +5648,10 @@ const init = async () => {
     console.log('📍 Loading wired node locations...');
     await loadWiredNodeLocations();
 
+    // Load country boundaries from GeoJSON
+    console.log('🗺️ Loading country boundaries...');
+    await loadCountryBoundaries();
+
     // Initialize audio detection for Grok compatibility
     console.log('🎤 Initializing audio detection...');
     await initAudioDetection();
@@ -3789,6 +5665,40 @@ const init = async () => {
 
     console.log('Fetching all data in background...');
     fetchAllData();
+
+    // Initialize mode indicator overlay
+    updateModeIndicator();
+    
+    // Wire up quick date buttons for existing filters panel
+    const lastHourBtn = document.getElementById('filter-last-hour');
+    if (lastHourBtn) {
+      lastHourBtn.addEventListener('click', () => {
+        const end = new Date();
+        const start = new Date(end.getTime() - 60 * 60 * 1000);
+        document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+        document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+      });
+    }
+    
+    const last24hBtn = document.getElementById('filter-last-24h');
+    if (last24hBtn) {
+      last24hBtn.addEventListener('click', () => {
+        const end = new Date();
+        const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+        document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+        document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+      });
+    }
+    
+    const lastWeekBtn = document.getElementById('filter-last-week');
+    if (lastWeekBtn) {
+      lastWeekBtn.addEventListener('click', () => {
+        const end = new Date();
+        const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+        document.getElementById('filter-start-date').value = start.toISOString().slice(0, 16);
+        document.getElementById('filter-end-date').value = end.toISOString().slice(0, 16);
+      });
+    }
 
     await speakQueued('Welcome to Qualoo global network monitoring.', window.TTS_PRIORITY.INFO);
 
@@ -3806,14 +5716,307 @@ window.initGlobalLatencyView = init;
 
 processAndFeedTickerFromApi();
 setInterval(processAndFeedTickerFromApi, 60000); // 1 minute for ticker updates (reduced from 3 minutes)
-setInterval(pollLatestTest, 30000); // 30 seconds for test polling (reduced frequency)
+setInterval(pollLatestTest, 10000); // 10 seconds for test polling (increased cadence)
+setInterval(updateTickerFromHourlyIssues, 120000); // 2 minutes: worst ISPs
 
+// Periodic mode swap between latency and compliance views (every 3 minutes)
+setInterval(() => {
+  toggleComplianceView(true); // true = automatic (with TTS announcement)
+}, 180000); // 3 minutes
+
+// Periodic refresh of historical data (every 10 minutes) to backfill any missed tests
+setInterval(async () => {
+  try {
+    console.log('🔄 Refreshing historical data from API...');
+    const res = await fetch('http://localhost:8000/api/latency-data?limit=500');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.rows || !data.rows.length) return;
+    
+    // Merge new data with existing, avoiding duplicates by ID
+    if (!state.allDataForStats) state.allDataForStats = [];
+    const existingIds = new Set(state.allDataForStats.map(d => d.id).filter(Boolean));
+    const newRecords = data.rows.filter(row => !existingIds.has(row.id)).map(row => ({
+      ...row,
+      latency: parseFloat(row.avgTime) || 0
+    }));
+    
+    if (newRecords.length > 0) {
+      state.allDataForStats = [...state.allDataForStats, ...newRecords];
+      
+      // Keep only last 4 hours
+      const maxDataPoints = Math.min(CONFIG.statsDataLimit, 14400);
+      if (state.allDataForStats.length > maxDataPoints) {
+        state.allDataForStats = state.allDataForStats.slice(-maxDataPoints);
+      }
+      
+      console.log(`✅ Added ${newRecords.length} new records. Total: ${state.allDataForStats.length}`);
+    }
+  } catch (e) {
+    console.warn('Failed to refresh historical data:', e);
+  }
+}, 600000); // Every 10 minutes
+// Speak HUD highlights/lowlights regularly with infrastructure insights
+setInterval(() => {
+  try {
+    const hud = state.latestHUD;
+    if (!hud) return;
+    // Best country by highest complianceRate (global) with minimum data
+    let bestCountry = null;
+    let worstCountry = null;
+    Object.entries(hud.countryStatsEnhanced || {}).forEach(([code, c]) => {
+      const gc = safeNumber(c.globalCompliance, 0);
+      const rc = safeNumber(c.regionalCompliance, 0);
+      const score = (gc + rc) / 2;
+      if (!bestCountry || score > bestCountry.score) bestCountry = { code, gc, rc, score };
+      if (!worstCountry || score < worstCountry.score) worstCountry = { code, gc, rc, score };
+    });
+    
+    if (bestCountry) {
+      const key = `best-country-${bestCountry.code}-${Math.round(bestCountry.gc)}-${Math.round(bestCountry.rc)}`;
+      const cname = getCountryName(bestCountry.code);
+      const messages = [
+        `Strongest connectivity: ${cname}! Local connections inside ${cname} are around ${Math.round(bestCountry.rc)} percent reliable; international connections from ${cname} about ${Math.round(bestCountry.gc)} percent. This is what proper infrastructure planning achieves!`,
+        `Excellence in ${cname}: ${Math.round(bestCountry.rc)} percent reliable locally, ${Math.round(bestCountry.gc)} percent globally. This proves sub-200 milli-second connectivity is possible with the right submarine routes and internet exchanges!`,
+        `${cname} leads the pack with ${Math.round(bestCountry.gc)} percent global reliability! The Qualoo network documents these success stories. Let's replicate this infrastructure excellence worldwide!`
+      ];
+      speakOnce(key, messages[Math.floor(Math.random() * messages.length)]);
+    }
+    
+    if (worstCountry) {
+      const key = `worst-country-${worstCountry.code}-${Math.round(worstCountry.gc)}-${Math.round(worstCountry.rc)}`;
+      const cname = getCountryName(worstCountry.code);
+      const messages = [
+        `Needs attention in ${cname}: local connections roughly ${Math.round(worstCountry.rc)} percent reliable; international connections about ${Math.round(worstCountry.gc)} percent. This region needs better submarine cables and internet exchange investments!`,
+        `${cname} struggling with ${Math.round(worstCountry.gc)} percent global reliability. New submarine routes and improved peering could transform this! The Qualoo network is mapping the optimal infrastructure paths.`,
+        `Infrastructure gap detected in ${cname}: ${Math.round(worstCountry.rc)} percent local, ${Math.round(worstCountry.gc)} percent global reliability. Operators should aim for sub-200 milli-second global connectivity. Qualoo premium insights show the way!`
+      ];
+      speakOnce(key, messages[Math.floor(Math.random() * messages.length)]);
+    }
+    
+    // Best/worst operators (by effective compliance if present)
+    const ops = Object.values(hud.operatorStats || {});
+    if (ops.length > 0) {
+      // Calculate combined compliance score (average of regional and global)
+      const sortedOps = ops.filter(o => safeNumber(o.total, 0) > 0).sort((a,b) => {
+        const aScore = (safeNumber(a.regionalCompliance, 0) + safeNumber(a.globalCompliance, 0)) / 2;
+        const bScore = (safeNumber(b.regionalCompliance, 0) + safeNumber(b.globalCompliance, 0)) / 2;
+        return bScore - aScore;
+      });
+      const bestOp = sortedOps[0];
+      const worstOp = sortedOps[sortedOps.length - 1];
+      
+      if (bestOp) {
+        const opName = safeExtractData(bestOp, 'op', '');
+        const country = bestOp.country ? getCountryName(bestOp.country) : '';
+        const compliance = Math.round((safeNumber(bestOp.regionalCompliance, 0) + safeNumber(bestOp.globalCompliance, 0)) / 2);
+        
+        // Only speak if we have valid data
+        if (opName && country && country !== 'Unknown') {
+          const key = `best-op-${opName}-${compliance}`;
+          speakOnce(key, `Top operator: ${opName}${country ? ` in ${country}` : ''}! Meeting targets on roughly ${compliance} percent of connections. This is the benchmark other providers should aim for!`);
+        }
+      }
+      
+      if (worstOp) {
+        const opName = safeExtractData(worstOp, 'op', '');
+        const country = worstOp.country ? getCountryName(worstOp.country) : '';
+        const compliance = Math.round((safeNumber(worstOp.regionalCompliance, 0) + safeNumber(worstOp.globalCompliance, 0)) / 2);
+        
+        // Only speak if we have valid data
+        if (opName && country && country !== 'Unknown') {
+          const key = `worst-op-${opName}-${compliance}`;
+          const messages = [
+            `Challenged operator: ${opName}${country ? ` in ${country}` : ''}. Currently around ${compliance} percent compliant. Better route planning and infrastructure collaboration could improve this!`,
+            `${opName}${country ? ` in ${country}` : ''} needs improvement at ${compliance} percent compliance. The guardians are monitoring. Time to invest in better connectivity!`
+          ];
+          speakOnce(key, messages[Math.floor(Math.random() * messages.length)]);
+        }
+      }
+    }
+  } catch (e) { console.warn('TTS HUD highlights failed', e); }
+}, 120000); // every 2 minutes (doubled from 60s)
+
+// Speak top current issues from hourly API with infrastructure context
+async function ttsFromHourlyIssues() {
+  try {
+    const res = await fetch('http://localhost:8000/api/hourly-issues');
+    if (!res.ok) return;
+    const data = await res.json();
+    const issues = data?.issues || [];
+    if (!Array.isArray(issues) || issues.length === 0) return;
+    const top = issues.slice(0, 5);
+    
+    top.forEach(it => {
+      const op = safeExtractData(it, 'operator_name', '') || safeExtractData(it, 'operator', '').trim();
+      const country = getCountryName(safeExtractData(it, 'src_iso2', '') || safeExtractData(it, 'src_country', ''));
+      const p95 = Math.round(safeNumber(it.p95_ms, 0));
+      const eff = safeNumber(it.eff_compliance_pct, null);
+      
+      // Only speak if we have operator, country, and a positive p95 value
+      if (!op || !country || !p95 || country === 'Unknown') return;
+      
+      const key = `hourly-issue-${op}-${country}-${p95}-${eff !== null ? Math.round(eff) : 'na'}`;
+      
+      // Varied messaging with infrastructure insights
+      const messageVariants = [
+        () => {
+          const parts = [`Warning: ${op} in ${country}`, `upper latency ${p95} milliseconds`];
+          if (eff !== null && !Number.isNaN(eff)) parts.push(`compliance about ${Math.round(eff)} percent`);
+          if (p95 > 300) parts.push('This route may need better submarine connectivity');
+          return parts.join(' — ') + '.';
+        },
+        () => {
+          let msg = `Performance alert: ${op} in ${country} showing ${p95} milliseconds`;
+          if (eff !== null && !Number.isNaN(eff)) msg += ` with ${Math.round(eff)} percent compliance`;
+          if (p95 > 400) msg += '. Critical regulatory breach! Infrastructure investment needed!';
+          else if (p95 > 250) msg += '. Sub-200 millisecond connectivity should be the goal!';
+          return msg + ' The guardians are monitoring.';
+        },
+        () => {
+          let msg = `${op} in ${country}: ${p95} milliseconds`;
+          if (p95 > 300) msg += '. This region could benefit from improved submarine routes and internet exchange collaboration';
+          msg += '. Qualoo insights map better paths';
+          return msg + '.';
+        }
+      ];
+      
+      const msg = messageVariants[Math.floor(Math.random() * messageVariants.length)]();
+      speakOnce(key, msg, window.TTS_PRIORITY.BAD_PERFORMANCE);
+    });
+  } catch (e) { console.warn('ttsFromHourlyIssues failed', e); }
+}
+
+setInterval(ttsFromHourlyIssues, 120000); // every 2 minutes (doubled from 60s)
+
+// Educational pulse with infrastructure vision and guardian themes
+function ttsEducationPulse() {
+  try {
+    if (!state.educationCoreMsgs) {
+      state.educationCoreMsgs = [
+        'Quality internet powers more than videos — robots, drones, and AI all need low latency to think and act in real time. Sub-200 millisecond global connectivity should be the standard!',
+        'The digital divide is not a chart, it is missed opportunities. Better connectivity lifts education, health, and commerce. New submarine routes and internet exchanges can bridge this gap!',
+        'Decentralized networks, smart cities, and autonomous systems only work with reliable, low-latency links. Performance is infrastructure. Central Europe proves sub-150 millisecond global reach is possible!',
+        'Machines need great internet too — every extra hundred milliseconds is hesitation for a robot or drift for a drone. Operators should plan global networks for sub-200 millisecond performance!',
+        'Qualoo is the blueprint to a better connected world — measurement to insight, insight to action. The guardians of the internet are mapping the optimal routes for universal connectivity!',
+        'Connectivity is opportunity. When networks improve through better submarine cables and internet exchanges, communities accelerate. The Qualoo network shows where infrastructure investment matters most!',
+        'Central Europe connects to the world in under 150 milliseconds. Why? Strategic submarine routes, efficient internet exchanges, and collaborative planning. Let\'s replicate this everywhere!',
+        'New submarine cables aren\'t just infrastructure — they\'re economic lifelines. Every region deserves sub-200 millisecond global connectivity. The Qualoo network maps where these investments deliver maximum impact!'
+      ];
+    }
+    if (!state.educationCtaMsgs) {
+      state.educationCtaMsgs = [
+        'Run a quick connectivity test — every test helps map problem routes and identify where new submarine cables are needed! Powered by Qualoo network and guardians worldwide.',
+        'Help close the digital divide — add your region to the live map with Qualoo. Your data helps operators plan better global networks and submarine routes!',
+        'Join the guardians of the internet — your tests highlight where networks need improvement and where infrastructure investment delivers results. Download the Qualoo app!',
+        'Become a guardian — run the Qualoo app and help us map the optimal routes for sub-200 millisecond global connectivity. Together we\'re building a better internet!',
+        'Every Qualoo test you run adds to the global map of internet performance. Help operators identify where new submarine routes and exchanges are needed most!'
+      ];
+    }
+    if (typeof state.educationIdx !== 'number') state.educationIdx = 0;
+    if (typeof state.educationCtaIdx !== 'number') state.educationCtaIdx = 0;
+
+    const now = Date.now();
+    const canSpeakCTA = !state.lastEducationCTA || (now - state.lastEducationCTA > 10 * 60 * 1000); // 10 minutes
+    let msg, key;
+    if (canSpeakCTA) {
+      msg = state.educationCtaMsgs[state.educationCtaIdx % state.educationCtaMsgs.length];
+      key = `edu-cta-${state.educationCtaIdx}`;
+      state.educationCtaIdx = (state.educationCtaIdx + 1) % state.educationCtaMsgs.length;
+      state.lastEducationCTA = now;
+    } else {
+      msg = state.educationCoreMsgs[state.educationIdx % state.educationCoreMsgs.length];
+      key = `edu-core-${state.educationIdx}`;
+      state.educationIdx = (state.educationIdx + 1) % state.educationCoreMsgs.length;
+    }
+    speakOnce(key, msg, window.TTS_PRIORITY.INFO);
+  } catch (e) { console.warn('ttsEducationPulse failed', e); }
+}
+
+setInterval(ttsEducationPulse, 150000); // every 2.5 minutes (doubled from 75s)
+
+// 24-hour overview TTS: major issues, >400ms routes, worst operators/countries
+async function tts24hOverview() {
+  try {
+    const [hlResp, ranksResp] = await Promise.all([
+      fetch('http://localhost:8000/api/high-latency-24h'),
+      fetch('http://localhost:8000/api/global-rankings-24h')
+    ]);
+    if (!hlResp.ok && !ranksResp.ok) return;
+    const hl = hlResp.ok ? await hlResp.json().catch(() => ({})) : {};
+    const rk = ranksResp.ok ? await ranksResp.json().catch(() => ({})) : {};
+
+    // Derive counts
+    let totalCritical = 0;
+    let routesOver400 = 0;
+    // If API provides aggregated arrays/maps, compute from them
+    try {
+      const routes = Array.isArray(hl.routes) ? hl.routes : [];
+      if (routes.length > 0) {
+        routesOver400 = routes.filter(r => Math.round(Number(r.p95_ms || r.avg_ms || 0)) > 400).length;
+      }
+      // Derive critical from country or operator summaries if present
+      const cs = hl.countrySummary || {};
+      const os = hl.operatorSummary || {};
+      if (Object.keys(cs).length > 0) {
+        Object.values(cs).forEach(v => {
+          if (v && (v.links_1000ms_plus || 0) > 0) totalCritical += Number(v.links_1000ms_plus || 0);
+        });
+      } else if (routesOver400 > 0) {
+        totalCritical = Math.round(routesOver400 * 0.2); // heuristic fallback
+      }
+    } catch {}
+
+    // Build worst operator/country lists
+    const worstOps = [];
+    try {
+      if (hl.operatorSummary) {
+        Object.entries(hl.operatorSummary).forEach(([op, v]) => {
+          worstOps.push({ op, worst: Number(v.worst_p95 || v.avg_ms || 0) });
+        });
+      } else if (Array.isArray(rk?.items)) {
+        rk.items.forEach(it => { if (it?.operator) worstOps.push({ op: it.operator, worst: Number(it.p95_ms || it.avg || 0) }); });
+      }
+    } catch {}
+    worstOps.sort((a,b) => (b.worst||0) - (a.worst||0));
+    const topOps = worstOps.filter(x => (x.worst||0) > 0).slice(0,3).map(x => x.op);
+
+    const worstCountries = [];
+    try {
+      if (hl.countrySummary) {
+        Object.entries(hl.countrySummary).forEach(([c, v]) => {
+          worstCountries.push({ c, worst: Number(v.worst_p95 || 0) });
+        });
+      } else if (Array.isArray(rk?.topWorstCountries)) {
+        rk.topWorstCountries.forEach(it => worstCountries.push({ c: it.country, worst: Number(it.avg || 0) }));
+      }
+    } catch {}
+    worstCountries.sort((a,b) => (b.worst||0) - (a.worst||0));
+    const topCountries = worstCountries.filter(x => (x.worst||0) > 0).slice(0,3).map(x => getCountryName(x.c));
+
+    // Compose message
+    const parts = [];
+    if (totalCritical || routesOver400) {
+      const rc = routesOver400 || 0;
+      const tc = totalCritical || 0;
+      parts.push(`24-hour overview: ${tc} major issues and about ${rc} routes with upper latency over 400 milliseconds.`);
+    }
+    if (topOps.length) parts.push(`Operators under pressure include ${topOps.join(', ')}.`);
+    if (topCountries.length) parts.push(`Challenged countries include ${topCountries.join(', ')}.`);
+    const msg = parts.join(' ');
+    if (!msg) return;
+    const k = `24h-${routesOver400}-${totalCritical}-${topOps.join('-')}-${topCountries.join('-')}`;
+    speakOnce(k, msg, window.TTS_PRIORITY.INFO);
+  } catch (e) { console.warn('tts24hOverview failed', e); }
+}
+
+setInterval(tts24hOverview, 240000); // every 4 minutes (doubled from 2 minutes)
 // Add periodic news-style TTS updates
 const triggerNewsUpdate = async () => {
   // Check if we should skip this update based on timing
   const now = performance.now();
   const timeSinceLastUpdate = now - (state.lastNewsUpdate || 0);
-  const minInterval = 120000; // 2 minutes minimum between updates (allows 30s Grok speech + 90s silence)
+  const minInterval = 240000; // 4 minutes minimum between updates (doubled from 2 minutes)
   
   if (timeSinceLastUpdate < minInterval) {
     console.log('⏰ Skipping news update - too soon since last update:', Math.round(timeSinceLastUpdate / 1000), 'seconds');
@@ -3900,6 +6103,27 @@ function getCountryName(code) {
   return countryCodeToName[code] || code || 'Unknown';
 }
 
+// Helper function to safely extract data and prevent undefined readings
+const safeExtractData = (obj, path, defaultValue = 'Unknown') => {
+  try {
+    const keys = path.split('.');
+    let value = obj;
+    for (const key of keys) {
+      if (value == null || value === undefined) return defaultValue;
+      value = value[key];
+    }
+    return (value == null || value === undefined) ? defaultValue : value;
+  } catch {
+    return defaultValue;
+  }
+};
+
+// Helper to safely get numeric value with fallback
+const safeNumber = (val, defaultVal = 0) => {
+  const num = Number(val);
+  return (!isNaN(num) && isFinite(num)) ? num : defaultVal;
+};
+
 const generateTTSNewsUpdate = (stats) => {
   const messages = [];
   
@@ -3908,20 +6132,11 @@ const generateTTSNewsUpdate = (stats) => {
     state.ttsMessageTypeCounter = 0;
   }
   
-  // Rotate through different message types to ensure variety
-  let messageType = state.ttsMessageTypeCounter % 10; // 0-9 for different message types (added 2 more for 24h data)
+  // Rotate through different message types to ensure variety - expanded to 18 types
+  let messageType = state.ttsMessageTypeCounter % 18;
   state.ttsMessageTypeCounter++;
   
-  console.log('📊 Generating news update:', {
-    messageType,
-    worstPerformers: stats.worstPerformers?.length || 0,
-    topWorstCountries: stats.topWorstCountries?.length || 0,
-    avgLatency: stats.avgLatency,
-    complianceRate: stats.complianceRate,
-    seriousBreaches: stats.seriousBreaches
-  });
-  
-  // Get current stats from the updateHUD function context
+  // Safe extraction with null checks
   const {
     worstPerformers = [],
     topWorstCountries = [],
@@ -3933,184 +6148,460 @@ const generateTTSNewsUpdate = (stats) => {
     complianceRate = 0,
     seriousBreaches = 0
   } = stats || {};
+  
+  // Safely extract HUD data (countryStatsEnhanced and operatorStats are ARRAYS, not objects)
+  const hud = state.latestHUD || {};
+  const countryStats = hud.countryStatsEnhanced || [];  // ARRAY
+  const operatorStats = hud.operatorStats || [];        // ARRAY
+  const fieldTileData = hud.fieldTiles || {};
+  
+  console.log('📊 Generating news update:', {
+    messageType,
+    worstPerformers: worstPerformers?.length || 0,
+    topWorstCountries: topWorstCountries?.length || 0,
+    avgLatency: safeNumber(avgLatency),
+    complianceRate: safeNumber(complianceRate),
+    seriousBreaches: safeNumber(seriousBreaches),
+    countriesTracked: Object.keys(countryStats).length,
+    operatorsTracked: Object.keys(operatorStats).length
+  });
 
   // Message Type 0: Critical 400ms+ Regulation Breaches (News Anchor Style)
-  if (messageType === 0 && seriousBreaches > 0) {
-    const worst = worstPerformers.length > 0 ? worstPerformers[0] : null;
-    if (worst && worst.avg > 400) {
+  if (messageType === 0 && safeNumber(seriousBreaches, 0) > 0) {
+    const worst = (worstPerformers && worstPerformers.length > 0) ? worstPerformers[0] : null;
+    const worstLatency = worst ? Math.round(safeNumber(worst.avg, 0)) : 0;
+    
+    if (worst && worstLatency > 400) {
+      const operator = safeExtractData(worst, 'op', 'Unknown Operator');
+      const country = getCountryName(safeExtractData(worst, 'country', 'XX'));
+      const breachCount = safeNumber(seriousBreaches, 0);
+      
       messages.push(
-        `🚨 BREAKING: We're seeing catastrophic latency from ${worst.op} in ${getCountryName(worst.country)} - a whopping ${worst.avg} milli-seconds! That's way over the 400 milli-second regulatory threshold that most countries enforce. This could be crippling digital connectivity and violating international standards! ${seriousBreaches} total breaches detected. Don't forget to subscribe to Qualoo insights at qualoo.io to dramatically improve your quality of service for customers.`
+        `🚨 BREAKING ALERT: Catastrophic latency detected! ${operator} in ${country} is delivering a devastating ${worstLatency} milli-seconds - way over the 400 milli-second regulatory threshold! This is crippling digital connectivity and violating international standards! ${breachCount} total breaches detected. The guardians of the internet are documenting these violations!`
       );
     } else {
+      const breachCount = safeNumber(seriousBreaches, 0);
       messages.push(
-        `⚠️ ALERT: ${seriousBreaches} serious regulatory breaches detected across the global network. These 400 milli-second-plus violations could be shutting down digital services worldwide. Immediate investigation needed! And remember, download the Qualoo app from qualoo.io/download to become part of democratizing internet performance mapping and become a guardian of the internet.`
+        `⚠️ REGULATORY ALERT: ${breachCount} serious regulatory breaches detected across the global network! These 400 milli-second-plus violations are shutting down digital services worldwide. Immediate investigation needed!`
       );
     }
   }
 
   // Message Type 1: Bad ISP Callout (Fun and Sarcastic)
-  else if (messageType === 1 && worstPerformers.length > 0) {
-    const worst = worstPerformers[0];
-    if (worst.avg > 200) {
+  else if (messageType === 1 && worstPerformers && worstPerformers.length > 0) {
+    const worst = worstPerformers[0] || {};
+    const operator = safeExtractData(worst, 'op', 'Unknown Operator');
+    const country = getCountryName(safeExtractData(worst, 'country', 'XX'));
+    const latency = Math.round(safeNumber(worst.avg, 0));
+    
+    if (latency > 200) {
       const digs = [
-        `Oh dear, ${worst.op} in ${getCountryName(worst.country)} is serving up ${worst.avg} milli-seconds of pure agony. Is this dial-up from the 90s? Operators, don't forget to subscribe to Qualoo insights to dramatically improve your quality of service for customers.`,
-        `Well, well, well... ${worst.op} thinks ${worst.avg} milli-seconds is acceptable? That's not connectivity, that's cruelty! Download the Qualoo app from qualoo.io/download and become a guardian of the internet.`,
-        `Breaking news from the slow lane: ${worst.op} in ${getCountryName(worst.country)} is dragging at ${worst.avg} milli-seconds. Someone call the internet police! And remember, Qualoo helps operators dramatically improve customer experience and meet global QoS standards.`
+        `Oh dear, ${operator} in ${country} is serving up ${latency} milli-seconds of pure agony! Is this dial-up from the 90s? Someone needs a network upgrade!`,
+        `Well, well, well... ${operator} thinks ${latency} milli-seconds is acceptable? That's not connectivity, that's cruelty! The guardians of the internet are taking notes!`,
+        `Breaking news from the slow lane: ${operator} in ${country} is dragging at ${latency} milli-seconds! Someone call the internet police!`,
+        `ATTENTION ${operator} in ${country}: Your ${latency} milli-second performance is embarrassing! Is your network powered by carrier pigeons? The guardians are documenting everything!`
       ];
       messages.push(digs[Math.floor(Math.random() * digs.length)]);
     }
   }
 
   // Message Type 2: Bad Country Callout (News Anchor Dramatic)
-  else if (messageType === 2 && topWorstCountries.length > 0) {
-    const worstCountry = topWorstCountries[0];
-    if (worstCountry.avg > 250) {
-      messages.push(
-        `🌍 COUNTRY ALERT: ${getCountryName(worstCountry.country)} is averaging ${worstCountry.avg} milli-seconds across ${worstCountry.operatorsCount} struggling operators. This level of latency is devastating digital connectivity between nations and could be costing millions in lost productivity! Operators in this region should subscribe to Qualoo insights to dramatically improve their quality of service for customers.`
-      );
+  else if (messageType === 2 && topWorstCountries && topWorstCountries.length > 0) {
+    const worstCountry = topWorstCountries[0] || {};
+    const country = getCountryName(safeExtractData(worstCountry, 'country', 'XX'));
+    const latency = Math.round(safeNumber(worstCountry.avg, 0));
+    const operatorsCount = safeNumber(worstCountry.operatorsCount, 0);
+    
+    if (latency > 250) {
+      const callouts = [
+        `🌍 COUNTRY ALERT: ${country} is averaging ${latency} milli-seconds across ${operatorsCount} struggling operators! This level of latency is devastating digital connectivity between nations and could be costing millions in lost productivity!`,
+        `📢 NATION UNDER PRESSURE: ${country} shows ${latency} milli-second average with ${operatorsCount} operators underperforming! This digital infrastructure crisis demands action! Government intervention needed!`,
+        `🚨 CONNECTIVITY CRISIS: ${country} faces severe latency issues - ${latency} milli-seconds across ${operatorsCount} providers! This is the digital divide in action, tracked by guardians worldwide!`
+      ];
+      messages.push(callouts[Math.floor(Math.random() * callouts.length)]);
     }
   }
 
   // Message Type 3: Bad Route Callout (Technical but Fun)
   else if (messageType === 3) {
     const badRoutes = [];
+    if (regionsMatrix && typeof regionsMatrix === 'object') {
     Object.entries(regionsMatrix).forEach(([src, dests]) => {
+        if (dests && typeof dests === 'object') {
       Object.entries(dests).forEach(([dest, val]) => {
-        if (val && val.count > 5) {
-          const avg = Math.round(val.sum / val.count);
+            if (val && safeNumber(val.count, 0) > 5) {
+              const sum = safeNumber(val.sum, 0);
+              const count = safeNumber(val.count, 1);
+              const avg = Math.round(sum / count);
           if (avg > 300) {
-            badRoutes.push(`${src} to ${dest}: ${avg}ms`);
+                badRoutes.push({ route: `${src} to ${dest}`, latency: avg, count });
           }
         }
       });
+        }
     });
+    }
     
     if (badRoutes.length > 0) {
-      const worstRoute = badRoutes[0];
-      messages.push(
-        `🛣️ ROUTE NIGHTMARE: The connection from ${worstRoute.split(':')[0]} is crawling at ${worstRoute.split(':')[1].trim()}! This intercontinental congestion is strangling global digital connectivity. Submarine cables overheating? Download the Qualoo app from qualoo.io/download and become part of democratizing internet performance mapping - become a guardian of the internet.`
-      );
+      badRoutes.sort((a, b) => b.latency - a.latency);
+      const worst = badRoutes[0];
+      const callouts = [
+        `🛣️ ROUTE NIGHTMARE: The connection from ${worst.route} is crawling at ${worst.latency} milli-seconds! This intercontinental congestion is strangling global digital connectivity. Submarine cables overheating?`,
+        `🌐 GLOBAL ROUTE CRISIS: ${worst.route} showing ${worst.latency} milli-second latency across ${worst.count} connections! This is affecting international business and communication worldwide!`,
+        `⚠️ INTERCONTINENTAL BOTTLENECK: ${worst.route} route suffering ${worst.latency} milli-seconds! This backbone failure impacts millions. The guardians of the internet are documenting it!`
+      ];
+      messages.push(callouts[Math.floor(Math.random() * callouts.length)]);
     }
   }
 
-  // Message Type 4: Compliance Alert (Regulator Style)
+  // Message Type 4: Compliance Alert (Regulator Style) with Infrastructure Vision
   else if (messageType === 4) {
-    const compliance = Math.round(complianceRate);
-    if (compliance < 80) {
-      messages.push(
-        `📜 REGULATORY WATCHDOG: Only ${compliance}% compliance rate detected! That's ${100 - compliance}% of connections violating the sacred 400 milli-second threshold. ${seriousBreaches} major breaches identified. Time for some serious network housekeeping! Operators struggling with performance can subscribe to Qualoo premium insights for advanced analytics and optimization recommendations.`
-      );
-    } else {
-      messages.push(
-        `✅ COMPLIANCE CHECK: We're at ${compliance}% compliance. ${seriousBreaches > 0 ? `${seriousBreaches} minor breaches still need attention.` : 'Most connections are within regulatory guidelines.'} Remember, Qualoo premium insights help operators dramatically improve customer experience and meet global QoS standards.`
-      );
-    }
-  }
-
-  // Message Type 5: Top Offenders Summary (Award Ceremony Style)
-  else if (messageType === 5) {
-    const worst = worstPerformers.length > 0 ? worstPerformers[0] : null;
-    const worstCountry = topWorstCountries.length > 0 ? topWorstCountries[0] : null;
+    const compliance = Math.round(safeNumber(complianceRate, 0));
+    const breaches = safeNumber(seriousBreaches, 0);
     
-    if (worst && worst.avg > 300) {
-      messages.push(
-        `🏆 DUBIOUS ACHIEVEMENT AWARD goes to ${worst.op} in ${getCountryName(worst.country)} for ${worst.avg} milli-seconds of outstanding... slowness. This is impacting global digital connectivity in ways we can barely comprehend! Don't forget to subscribe to Qualoo insights to dramatically improve your quality of service for customers.`
-      );
-    } else if (worstCountry && worstCountry.avg > 300) {
-      messages.push(
-        `🌍 COUNTRY OF CONCERN: ${getCountryName(worstCountry.country)} takes the latency crown at ${worstCountry.avg} milli-seconds average. ${worstCountry.operatorsCount} operators need urgent intervention to restore digital connectivity. Qualoo premium insights help operators dramatically improve customer experience and meet global QoS standards.`
-      );
+    if (compliance < 80) {
+      const alerts = [
+        `📜 REGULATORY WATCHDOG: Only ${compliance}% compliance rate detected! That's ${100 - compliance}% of connections violating the 400 milli-second threshold. ${breaches} major breaches identified. Time for serious network housekeeping!`,
+        `⚠️ COMPLIANCE CRISIS: ${compliance}% compliance means ${100 - compliance}% of global connections are failing! ${breaches} breaches documented. We need new submarine routes and better internet exchanges! Central Europe reaches the world in under 150 milli-seconds - other regions deserve this too!`,
+        `🚨 INFRASTRUCTURE GAP: ${compliance}% compliance reveals systemic failures. ${breaches} violations detected. The guardians are documenting where new submarine cables and exchange points are needed!`
+      ];
+      messages.push(alerts[Math.floor(Math.random() * alerts.length)]);
     } else {
       messages.push(
-        `📊 NETWORK PULSE: Global average holding at ${avgLatency} milli-seconds with ${Math.round(complianceRate)}% regulatory compliance. Digital connectivity remains stable... for now. And remember, download the Qualoo app from qualoo.io/download to become part of democratizing internet performance mapping and become a guardian of the internet.`
+        `✅ COMPLIANCE CHECK: We're at ${compliance}% compliance. ${breaches > 0 ? `${breaches} breaches still need attention.` : 'Most connections meet regulatory guidelines.'} But why stop at 400 milli-seconds? Central Europe proves sub-150 milli-second global reach is possible! Let's map the routes to make this universal.`
       );
     }
   }
 
-  // Message Type 6: Digital Connectivity Impact (Educational)
+  // Message Type 5: Top Offenders Summary with Infrastructure Solutions
+  else if (messageType === 5) {
+    const worst = (worstPerformers && worstPerformers.length > 0) ? worstPerformers[0] : null;
+    const worstCountry = (topWorstCountries && topWorstCountries.length > 0) ? topWorstCountries[0] : null;
+    const worstLatency = worst ? Math.round(safeNumber(worst.avg, 0)) : 0;
+    const countryLatency = worstCountry ? Math.round(safeNumber(worstCountry.avg, 0)) : 0;
+    
+    if (worst && worstLatency > 300) {
+      const operator = safeExtractData(worst, 'op', 'Unknown Operator');
+      const country = getCountryName(safeExtractData(worst, 'country', 'XX'));
+      messages.push(
+        `🏆 DUBIOUS ACHIEVEMENT AWARD: ${operator} in ${country} delivers ${worstLatency} milli-seconds of outstanding... slowness! This impacts global digital connectivity! The solution? Better peering, new submarine routes, optimized exchanges!`
+      );
+    } else if (worstCountry && countryLatency > 300) {
+      const country = getCountryName(safeExtractData(worstCountry, 'country', 'XX'));
+      const operators = safeNumber(worstCountry.operatorsCount, 0);
+      messages.push(
+        `🌍 INFRASTRUCTURE CHALLENGE: ${country} averages ${countryLatency} milli-seconds across ${operators} operators. This region needs better connectivity! New submarine cables, improved internet exchanges, and regional collaboration can reduce this. Central Europe proves sub-200 milli-second global reach is achievable!`
+      );
+    } else {
+      const avgLat = Math.round(safeNumber(avgLatency, 0));
+      const comp = Math.round(safeNumber(complianceRate, 0));
+      messages.push(
+        `📊 NETWORK PULSE: Global average at ${avgLat} milli-seconds with ${comp}% compliance. But the vision is sub-200 milli-second worldwide connectivity! Central Europe achieves under 150 milli-seconds globally - let's map routes to make this universal!`
+      );
+    }
+  }
+
+  // Message Type 6: Infrastructure Planning & Submarine Routes Vision
   else if (messageType === 6) {
     const highLatencyRoutes = [];
+    if (regionsMatrix && typeof regionsMatrix === 'object') {
     Object.entries(regionsMatrix).forEach(([src, dests]) => {
+        if (dests && typeof dests === 'object') {
       Object.entries(dests).forEach(([dest, val]) => {
-        if (val && val.count > 5) {
-          const avg = Math.round(val.sum / val.count);
+            if (val && safeNumber(val.count, 0) > 5) {
+              const sum = safeNumber(val.sum, 0);
+              const count = safeNumber(val.count, 1);
+              const avg = Math.round(sum / count);
           if (avg > 250) {
-            highLatencyRoutes.push({ route: `${src}-${dest}`, latency: avg });
+                highLatencyRoutes.push({ route: `${src} to ${dest}`, latency: avg, count });
           }
         }
       });
+        }
     });
+    }
 
     if (highLatencyRoutes.length > 0) {
       const worstRoute = highLatencyRoutes.sort((a, b) => b.latency - a.latency)[0];
-      messages.push(
-        `🌐 DIGITAL DIVIDE ALERT: The ${worstRoute.route.replace('-', ' to ')} route is suffering ${worstRoute.latency} milli-second delays! This isn't just slow internet - it's breaking international business, telemedicine, and remote education. Global connectivity depends on fixing these underwater cable nightmares! Download the Qualoo app from qualoo.io/download and become part of democratizing internet performance mapping - become a guardian of the internet.`
-      );
-    }
-  }
-
-  // Message Type 7: Fun Recovery Message (When Things Are Good)
-  else if (messageType === 7) {
-    if (avgLatency < 150 && complianceRate > 90) {
-      const cheers = [
-        `🎉 Fantastic news! Global latency is cruising at just ${avgLatency} milli-seconds with ${Math.round(complianceRate)}% compliance. The digital world is connecting beautifully today! Even great operators can benefit from Qualoo premium insights to maintain exceptional performance.`,
-        `⭐ STELLAR PERFORMANCE: Networks worldwide are performing exceptionally with ${avgLatency} milli-second averages. Digital connectivity is thriving! Keep up the great work, internet wizards. And remember, download the Qualoo app from qualoo.io/download to become a guardian of the internet.`,
-        `🚀 MISSION ACCOMPLISHED: We're seeing excellent ${avgLatency} milli-second global averages. Regulatory compliance at ${Math.round(complianceRate)}%. The future of connectivity looks bright! Qualoo premium insights help operators dramatically improve customer experience and meet global QoS standards.`
+      const visions = [
+        `🌐 INFRASTRUCTURE VISION: The ${worstRoute.route} route suffers ${worstRoute.latency} milli-second delays! This isn't just slow internet - it's breaking international business, telemedicine, and education. We need new submarine cables and better internet exchanges! Central Europe connects globally in under 150 milli-seconds - this should be the standard worldwide!`,
+        `🛰️ ROUTE OPTIMIZATION NEEDED: ${worstRoute.route} showing ${worstRoute.latency} milli-seconds across ${worstRoute.count} connections! Providers should plan global networks for sub-200 milli-second performance. This needs new submarine routes, improved peering, and regional collaboration!`,
+        `🌍 SUBMARINE CABLE STRATEGY: ${worstRoute.route} route at ${worstRoute.latency} milli-seconds proves we need better undersea infrastructure! Central Europe's sub-150 milli-second global reach shows what's possible with proper planning. Guardians are mapping the best routes!`
       ];
-      messages.push(cheers[Math.floor(Math.random() * cheers.length)]      );
+      messages.push(visions[Math.floor(Math.random() * visions.length)]);
     }
   }
 
-  // Message Type 8: 24-Hour Global Rankings Summary
+  // Message Type 7: Success Stories & Infrastructure Excellence
+  else if (messageType === 7) {
+    const avgLat = Math.round(safeNumber(avgLatency, 0));
+    const comp = Math.round(safeNumber(complianceRate, 0));
+    
+    if (avgLat < 150 && comp > 90) {
+      const cheers = [
+        `🎉 EXCELLENCE ACHIEVED! Global latency cruising at just ${avgLat} milli-seconds with ${comp}% compliance! This is what happens when operators invest in submarine cables, internet exchanges, and smart routing! Central Europe leads the way - let's keep mapping and help other regions achieve this!`,
+        `⭐ STELLAR PERFORMANCE: Networks worldwide delivering ${avgLat} milli-second averages! This proves sub-200 milli-second global connectivity is achievable everywhere! Keep up the great work!`,
+        `🚀 INFRASTRUCTURE SUCCESS: Excellent ${avgLat} milli-second global averages with ${comp}% compliance! This is the result of proper network planning, optimal submarine routes, and efficient internet exchanges!`,
+        `🌟 CONNECTIVITY MILESTONE: ${avgLat} milli-seconds proves the vision works! When operators collaborate, invest in infrastructure, and use data-driven planning, everyone wins! Let's replicate this worldwide!`
+      ];
+      messages.push(cheers[Math.floor(Math.random() * cheers.length)]);
+    }
+  }
+
+  // Message Type 8: 24-Hour Global Rankings with Route Planning Insights
   else if (messageType === 8) {
     const rankings = state.globalRankings24h || [];
-    if (rankings.length > 0) {
-      const criticalCount = rankings.filter(r => r.severity === 'CRITICAL').length;
-      const majorCount = rankings.filter(r => r.severity === 'MAJOR').length;
-      const worstCountry = rankings.find(r => r.severity === 'CRITICAL') || rankings[0];
+    if (rankings && rankings.length > 0) {
+      const criticalCount = rankings.filter(r => safeExtractData(r, 'severity') === 'CRITICAL').length;
+      const majorCount = rankings.filter(r => safeExtractData(r, 'severity') === 'MAJOR').length;
+      const worstCountry = rankings.find(r => safeExtractData(r, 'severity') === 'CRITICAL') || rankings[0] || {};
 
       if (criticalCount > 0) {
+        const countryCode = safeExtractData(worstCountry, 'src_country', '') || safeExtractData(worstCountry, 'src_iso2', '');
+        const country = countryCode ? getCountryName(countryCode) : '';
+        const operator = safeExtractData(worstCountry, 'operator_name', '');
+        const latency = Math.round(safeNumber(worstCountry.p95_ms, 0));
+        
+        // Only speak if we have valid data
+        if (operator && country && country !== 'Unknown' && latency > 0) {
         messages.push(
-          `🌍 24-HOUR GLOBAL REPORT: ${criticalCount} critical provider issues detected worldwide! ${worstCountry.src_country} leads with ${worstCountry.operator_name} showing ${worstCountry.p95_ms} milli-second P95 latency. ${majorCount} additional major issues identified. Network operators worldwide need immediate attention!`
+            `🌍 24-HOUR GLOBAL REPORT: ${criticalCount} critical provider issues detected! ${operator} in ${country} showing ${latency} milli-seconds. ${majorCount} additional major issues identified. These regions need better submarine routes and internet exchanges! Network operators should aim for sub-200 milli-second global connectivity!`
         );
+        }
       } else if (majorCount > 0) {
+        const countryCode = safeExtractData(worstCountry, 'src_country', '') || safeExtractData(worstCountry, 'src_iso2', '');
+        const country = countryCode ? getCountryName(countryCode) : '';
+        const operator = safeExtractData(worstCountry, 'operator_name', '');
+        const latency = Math.round(safeNumber(worstCountry.p95_ms, 0));
+        
+        // Only speak if we have valid data
+        if (operator && country && country !== 'Unknown' && latency > 0) {
         messages.push(
-          `🌐 24-HOUR PERFORMANCE SUMMARY: ${majorCount} major latency issues identified globally. Top concern is ${worstCountry.operator_name} in ${worstCountry.src_country} at ${worstCountry.p95_ms} milli-seconds P95. Compliance rates vary significantly by region.`
+            `🌐 24-HOUR PERFORMANCE SUMMARY: ${majorCount} major latency issues identified globally. Top concern: ${operator} in ${country} at ${latency} milli-seconds P95. Compliance varies by region, but the goal is universal sub-200 milli-second connectivity! Central Europe proves it's achievable!`
         );
+        }
       } else {
-        const topPerformer = rankings.find(r => r.severity === 'OK');
-        if (topPerformer) {
+        const topPerformer = rankings.find(r => safeExtractData(r, 'severity') === 'OK') || rankings[0] || {};
+        const countryCode = safeExtractData(topPerformer, 'src_country', '') || safeExtractData(topPerformer, 'src_iso2', '');
+        const country = countryCode ? getCountryName(countryCode) : '';
+        const operator = safeExtractData(topPerformer, 'operator_name', '');
+        const latency = Math.round(safeNumber(topPerformer.p95_ms, 0));
+        const compliance = Math.round(safeNumber(topPerformer.eff_compliance_pct, 0));
+        
+        // Only praise if performance is actually good: sub-200ms and high compliance
+        if (operator && country && country !== 'Unknown' && latency > 0 && latency < 200 && compliance >= 90) {
           messages.push(
-            `✅ 24-HOUR GLOBAL STANDOUT: ${topPerformer.operator_name} in ${topPerformer.src_country} demonstrates excellent performance with ${topPerformer.p95_ms} milli-second P95 latency and ${topPerformer.eff_compliance_pct}% compliance. A benchmark for the industry!`
+            `✅ 24-HOUR EXCELLENCE: ${operator} in ${country} demonstrates exceptional ${latency} milli-seconds and ${compliance}% compliance! This is the benchmark! Proper network planning, strategic submarine routes, and optimized internet exchanges make this possible!`
           );
         }
       }
     }
   }
 
-  // Message Type 9: Hourly Issues Spotlight
+  // Message Type 9: Hourly Issues Spotlight (with safe data extraction)
   else if (messageType === 9) {
     const issues = state.hourlyIssues || [];
     if (issues.length > 0) {
-      const criticalIssues = issues.filter(i => i.severity === 'CRITICAL');
-      const worstIssue = issues[0];
+      const criticalIssues = issues.filter(i => safeExtractData(i, 'severity') === 'CRITICAL');
+      const worstIssue = issues[0] || {};
 
       if (criticalIssues.length > 0) {
+        const opName = safeExtractData(worstIssue, 'operator_name', '');
+        const countryCode = safeExtractData(worstIssue, 'src_country', '') || safeExtractData(worstIssue, 'src_iso2', '');
+        const country = countryCode ? getCountryName(countryCode) : '';
+        const latency = Math.round(safeNumber(worstIssue.p95_ms, 0));
+        
+        // Only speak if we have valid operator and country
+        if (opName && country && country !== 'Unknown' && latency > 0) {
         messages.push(
-          `🚨 HOURLY ALERT: ${criticalIssues.length} critical performance breaches in the last hour! ${worstIssue.operator_name} in ${worstIssue.src_country} showing ${worstIssue.p95_ms} milli-second P95 latency - this is severely impacting digital connectivity and requires immediate operator intervention.`
+            `🚨 HOURLY ALERT: ${criticalIssues.length} critical performance breaches in the last hour! ${opName} in ${country} showing ${latency} milli-seconds - this is severely impacting digital connectivity and requires immediate operator intervention. The guardians are watching!`
         );
+        }
       } else {
+        const opName = safeExtractData(worstIssue, 'operator_name', '');
+        const countryCode = safeExtractData(worstIssue, 'src_country', '') || safeExtractData(worstIssue, 'src_iso2', '');
+        const country = countryCode ? getCountryName(countryCode) : '';
+        const latency = Math.round(safeNumber(worstIssue.p95_ms, 0));
+        const issueType = safeExtractData(worstIssue, 'issue_type', 'performance issue').replace(/_/g, ' ').toLowerCase();
+        
+        // Only speak if we have valid operator and country
+        if (opName && country && country !== 'Unknown' && latency > 0) {
         messages.push(
-          `⚠️ CURRENT HOUR ISSUES: ${issues.length} performance concerns detected. Leading issue: ${worstIssue.operator_name} in ${worstIssue.src_country} with ${worstIssue.p95_ms} milli-second P95 latency. ${worstIssue.issue_type.replace(/_/g, ' ').toLowerCase()} affecting service quality.`
+            `⚠️ CURRENT HOUR ISSUES: ${issues.length} performance concerns detected. Leading issue: ${opName} in ${country} with ${latency} milli-seconds. ${issueType} affecting service quality.`
+          );
+        }
+      }
+    }
+  }
+
+  // Message Type 10: Regional Compliance Deep Dive (HUD field tiles data)
+  else if (messageType === 10) {
+    // countryStats is an ARRAY, not an object - use it directly
+    const regions = (Array.isArray(countryStats) ? countryStats : []).filter(data => {
+      const regional = safeNumber(data.regionalCompliance, 0);
+      const global = safeNumber(data.globalCompliance, 0);
+      return regional > 0 || global > 0;
+    });
+    
+    if (regions.length > 0) {
+      // Find best and worst regional performers
+      const sorted = regions.sort((a, b) => {
+        const scoreA = (safeNumber(a.regionalCompliance, 0) + safeNumber(a.globalCompliance, 0)) / 2;
+        const scoreB = (safeNumber(b.regionalCompliance, 0) + safeNumber(b.globalCompliance, 0)) / 2;
+        return scoreB - scoreA;
+      });
+      
+      const best = sorted[0];
+      const worst = sorted[sorted.length - 1];
+      const bestName = getCountryName(best.country);
+      const worstName = getCountryName(worst.country);
+      const bestScore = Math.round((safeNumber(best.regionalCompliance, 0) + safeNumber(best.globalCompliance, 0)) / 2);
+      const worstScore = Math.round((safeNumber(worst.regionalCompliance, 0) + safeNumber(worst.globalCompliance, 0)) / 2);
+      
+      // Only speak if we have valid country names
+      if (bestName && worstName && bestName !== 'Unknown' && worstName !== 'Unknown') {
+        messages.push(
+          `📊 REGIONAL COMPLIANCE ANALYSIS: ${bestName} leads with ${bestScore}% compliance - a model for the region! Meanwhile, ${worstName} struggles at ${worstScore}% - this digital divide must be bridged. Guardians worldwide make this transparency possible.`
         );
       }
     }
   }
 
+  // Message Type 11: Guardian Network Celebration
+  else if (messageType === 11) {
+    const totalTests = safeNumber(state.allDataForStats?.length, 0);
+    const activeCountries = Array.isArray(countryStats) ? countryStats.length : 0;
+    const activeOperators = Array.isArray(operatorStats) ? operatorStats.length : 0;
+    
+    const celebrations = [
+      `🌟 GUARDIANS OF THE INTERNET UPDATE: Our global network has monitored ${totalTests} connections across ${activeCountries} countries and ${activeOperators} operators! Your participation powers this real-time view. Together, we're mapping the world's internet quality with the Qualoo network!`,
+      `💪 NETWORK GUARDIANS: ${activeCountries} countries and ${activeOperators} operators under real-time surveillance by the Qualoo network! ${totalTests} data points analyzed. This is democracy in action - transparent, open internet monitoring for all!`,
+      `🛡️ GUARDIAN NETWORK STATUS: ${totalTests} live measurements tracking ${activeOperators} internet providers across ${activeCountries} nations. The Qualoo network, powered by guardians like you, ensures nobody can hide from poor performance. Download the app at qualoo.io to join us!`
+    ];
+    
+    messages.push(celebrations[Math.floor(Math.random() * celebrations.length)]);
+  }
+
+  // Message Type 12: Operator Spotlight - Hall of Shame
+  else if (messageType === 12 && worstPerformers.length > 0) {
+    const worst = worstPerformers[0] || {};
+    const operator = safeExtractData(worst, 'op', '');
+    const countryCode = safeExtractData(worst, 'country', '');
+    const country = countryCode ? getCountryName(countryCode) : '';
+    const latency = Math.round(safeNumber(worst.avg, 0));
+    const compliance = Math.round(safeNumber(worst.compliance, 0));
+    
+    // Only speak if we have valid operator and country
+    if (operator && country && country !== 'Unknown' && latency > 0) {
+      const shames = [
+        `🔴 HALL OF SHAME: ${operator} in ${country} earns today's wooden spoon with ${latency} milli-seconds and ${compliance}% compliance! This isn't just slow internet - this is breaking the social contract. The guardians are documenting everything!`,
+        `❌ PERFORMANCE DISASTER: ${operator} serving ${country} with a painful ${latency} milli-second experience! Only ${compliance}% compliance? That's unacceptable! The data doesn't lie. Time to step up or step aside!`,
+        `⚠️ PUBLIC SERVICE FAILURE: ${operator} in ${country} delivers ${latency} milli-seconds of frustration with just ${compliance}% compliance! Citizens deserve better! Communities can demand accountability!`
+      ];
+      
+      messages.push(shames[Math.floor(Math.random() * shames.length)]);
+    }
+  }
+
+  // Message Type 13: Country Spotlight - Champions and Strugglers
+  else if (messageType === 13) {
+    // countryStats is an ARRAY, not an object - use it directly
+    const countries = Array.isArray(countryStats) ? countryStats : [];
+    if (countries.length > 0) {
+      const scored = countries.map(data => {
+        const regional = safeNumber(data.regionalCompliance, 0);
+        const global = safeNumber(data.globalCompliance, 0);
+        const tests = safeNumber(data.operatorsCount, 0);  // Using operatorsCount as proxy for activity
+        return { 
+          country: data.country, 
+          regional, 
+          global, 
+          tests, 
+          score: (regional + global) / 2 
+        };
+      }).filter(c => c.tests > 0);
+      
+      scored.sort((a, b) => b.score - a.score);
+      
+      if (scored.length >= 2) {
+        const champion = scored[0];
+        const struggler = scored[scored.length - 1];
+        const championName = getCountryName(champion.country);
+        const strugglerName = getCountryName(struggler.country);
+        
+        // Only speak if we have valid country names
+        if (championName && strugglerName && championName !== 'Unknown' && strugglerName !== 'Unknown') {
+          messages.push(
+            `🏆 COUNTRY RANKINGS: ${championName} shines with ${Math.round(champion.score)}% compliance across ${champion.tests} operators - a digital infrastructure success story! But ${strugglerName} falls behind at ${Math.round(struggler.score)}% - the digital divide persists. Powered by our guardian community!`
+          );
+        }
+      }
+    }
+  }
+
+  // Message Type 14: Real-Time Network Intelligence
+  else if (messageType === 14) {
+    const recentTests = safeNumber(state.pendingArcs?.length, 0) + safeNumber(state.flightArcs?.length, 0);
+    const avgLat = Math.round(safeNumber(avgLatency, 0));
+    const comp = Math.round(safeNumber(complianceRate, 0));
+    
+    const intelligence = [
+      `🔍 REAL-TIME INTELLIGENCE: ${recentTests} live connections being monitored RIGHT NOW with ${avgLat} milli-second average latency. ${comp}% compliance rate. This is the power of distributed monitoring - the Qualoo network sees everything, everywhere, all at once!`,
+      `📡 LIVE MONITORING: ${recentTests} active network paths under surveillance. Global average: ${avgLat} milli-seconds, ${comp}% compliant. The guardians of the internet never sleep - we're watching 24/7 powered by the Qualoo network!`,
+      `🌐 NETWORK PULSE: ${recentTests} simultaneous measurements tracking global internet health. ${avgLat} milli-second average, ${comp}% meeting standards. This transparency empowers users worldwide - join us at qualoo.io!`
+    ];
+    
+    messages.push(intelligence[Math.floor(Math.random() * intelligence.length)]);
+  }
+
+  // Message Type 15: Digital Divide Crisis Mode
+  else if (messageType === 15 && topWorstCountries.length > 0) {
+    const worst = topWorstCountries[0] || {};
+    const countryCode = safeExtractData(worst, 'country', '');
+    const country = countryCode ? getCountryName(countryCode) : '';
+    const latency = Math.round(safeNumber(worst.avg, 0));
+    const operators = safeNumber(worst.operatorsCount, 0);
+    
+    // Only speak if we have valid country
+    if (country && country !== 'Unknown' && latency > 0) {
+      messages.push(
+        `🌍 DIGITAL DIVIDE CRISIS: ${country} faces a connectivity catastrophe with ${latency} milli-second average across ${operators} operators! This isn't just statistics - real people are being left behind in education, healthcare, and commerce. Governments and operators must act NOW!`
+      );
+    }
+  }
+
+  // Message Type 16: Qualoo Network Capabilities Showcase
+  else if (messageType === 16) {
+    const opsCount = Array.isArray(operatorStats) ? operatorStats.length : 0;
+    const countriesCount = Array.isArray(countryStats) ? countryStats.length : 0;
+    
+    const capabilities = [
+      `🚀 POWERED BY QUALOO: We're monitoring ${opsCount} internet providers across ${countriesCount} countries in REAL-TIME! No other platform delivers this level of transparency. Join the revolution - become a guardian at qualoo.io!`,
+      `💎 QUALOO NETWORK ADVANTAGE: Real-time latency tracking, compliance monitoring, and performance analysis across the entire planet! From submarine cables to satellite links, we see it all. This is internet democracy - powered by guardians like you!`,
+      `🌟 THE QUALOO DIFFERENCE: While others show you yesterday's data, we show you RIGHT NOW! Live performance monitoring, instant compliance checks, transparent global rankings. Download the app and become part of the guardian network!`
+    ];
+    
+    messages.push(capabilities[Math.floor(Math.random() * capabilities.length)]);
+  }
+
+  // Message Type 17: Call to Action - Guardian Recruitment
+  else if (messageType === 17) {
+    const ctas = [
+      `📲 JOIN THE GUARDIANS: Download the Qualoo app from qualoo.io/download and add YOUR region to the global map! Every test you run helps identify problem routes and bad actors. Together, we're building a transparent internet for everyone!`,
+      `🛡️ BECOME A GUARDIAN: The internet needs YOU! Run the Qualoo app or host a node to help monitor global network quality. Your data helps hold providers accountable and identifies underserved communities. Join us at qualoo.io!`,
+      `💪 GUARDIAN RECRUITMENT: Want to make a difference? Download Qualoo from qualoo.io/download and join thousands monitoring internet quality worldwide! Your participation exposes poor performance and helps bridge the digital divide. Be the change!`,
+      `🌍 GUARDIANS NEEDED: Help us map internet quality in YOUR area! Download the Qualoo app and run connectivity tests. Your data powers this global view and helps communities demand better service. Join the movement at qualoo.io!`
+    ];
+    
+    messages.push(ctas[Math.floor(Math.random() * ctas.length)]);
+  }
+
   // If no specific message was generated, provide a general update
   if (messages.length === 0) {
+    const avgLat = Math.round(safeNumber(avgLatency, 0));
+    const comp = Math.round(safeNumber(complianceRate, 0));
     messages.push(
-      `🌍 GLOBAL NETWORK UPDATE: Current average latency at ${avgLatency} milli-seconds with ${Math.round(complianceRate)}% regulatory compliance. Digital connectivity monitoring continues. Join the movement - download the Qualoo app from qualoo.io/download to become part of democratizing internet performance mapping and become a guardian of the internet.`
+      `🌍 GLOBAL NETWORK UPDATE: Qualoo network monitoring shows ${avgLat} milli-seconds average latency with ${comp}% regulatory compliance. Digital connectivity surveillance continues. Join the guardians of the internet - download the app from qualoo.io/download to become part of democratizing internet performance mapping!`
     );
   }
 
@@ -4246,7 +6737,6 @@ window.testAPIEndpoint = async () => {
     console.log('   4. CORS issues');
   }
 };
-
 // Function to test latest test endpoint
 window.testLatestTest = async () => {
   console.log('🧪 Testing latest test endpoint...');
@@ -4810,7 +7300,6 @@ const renderBenchmarkScatter = async () => {
     }
   });
 };
-
 // Function to update benchmark content
 const updateBenchmarkContent = (countryCode) => {
   console.log('🎯 Updating benchmark content for country:', countryCode);
@@ -5338,7 +7827,6 @@ window.refreshBenchmarkPanel = () => {
     createBenchmarkPanel();
   }
 };
-
 // Enhanced country benchmarking using ALL available data sources
 const generateComprehensiveCountryBenchmark = (countryCode) => {
   const countryName = getCountryName(countryCode);
@@ -5965,7 +8453,6 @@ window.showD3OperatorRankings = () => {
   // Create beautiful D3 operator rankings table
   createD3OperatorTable(svg, globalBenchmarks.operators);
 };
-
 // Create beautiful D3 operator table
 const createD3OperatorTable = (svg, operators) => {
   const width = 760;
@@ -6466,7 +8953,6 @@ const ensureD3Loaded = () => {
     checkD3();
   });
 };
-
 // Create rich D3 bubble chart with bouncing effects and tight packing
 const createBubbleChart = async () => {
   try {
@@ -7007,9 +9493,6 @@ function createBubbles(svg, bubbleData, viewType) {
   // Store simulation reference for cleanup
   window.bubbleChartState.currentSimulation = simulation;
 };
-
-
-
 // Generate comprehensive bubble data using benchmarking scores
 const generateComprehensiveBubbleData = () => {
   const allArcs = state.flightArcs.concat(state.pendingArcs);
